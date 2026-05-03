@@ -207,6 +207,14 @@ target_link_libraries(your_target PRIVATE sound_locator)
 C++/Python `ssl_demo` 可加 `--flip` 输出 `180 - doa`；
 集成应用中也可以 swap 通道或自行使用 `180 - doa`。
 
+**Q: 一直无有效结果？**
+
+置信度低于阈值或输入不是双声道。检查 WAV 声道数，降低 `confidence_threshold` 做验证。
+
+**Q: 结果抖动严重？**
+
+单帧噪声或混响影响。增大 `avg_frames`，或对输出做业务侧平滑。
+
 ## 5. 版本与发布
 
 版本以本组件文档或仓库 tag 为准。
