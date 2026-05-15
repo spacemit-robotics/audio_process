@@ -4,7 +4,12 @@ from pybind11.setup_helpers import Pybind11Extension, build_ext
 ext_modules = [
     Pybind11Extension(
         "spacemit_audio_process._spacemit_audio_process",
-        ["src/bindings.cpp", "../src/sound_locator.cpp"],
+        [
+            "src/bindings.cpp",
+            "../src/sound_locator.cpp",
+            "../src/gcc_phat_pair.cpp",
+            "../src/multi_sound_locator.cpp",
+        ],
         include_dirs=["../include"],
         libraries=["fftw3f", "m"],
         cxx_std=17,

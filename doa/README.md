@@ -195,6 +195,88 @@ target_link_libraries(your_target PRIVATE sound_locator)
 | `confidence_threshold` | `float` | `0.1` | 置信度阈值，低于此值结果标记为无效 |
 | `upsample_factor` | `int` | `0` | GCC 上采样因子；0 = 自动（目标 ≈ 4μs 时延分辨率） |
 
+
+## 3.4 三声道 DOA (MultiSoundLocator)
+
+`MultiSoundLocator` 是新增的多声道声源定位 API，和原有双声道 `SoundLocator` 并行存在。v1 固定采用 MPCC-LSQ：先对每个麦克风对执行 GCC-PHAT 得到 TDOA，再用麦克风几何矩阵做闭式最小二乘求解平面波方向，输出机器人坐标系下 `[0°, 360°)` 方位角。
+
+**C++ API 概览**：
+
+```cpp
+#include "multi_sound_locator.h"
+
+auto cfg = SpacemitAudio::MultiSoundLocator::CreateEquilateralTriangleConfig(0.063f);
+cfg.sample_rate = 16000;
+cfg.azimuth_offset_deg = 0.0f;
+
+SpacemitAudio::MultiSoundLocator loc(cfg);
+loc.Initialize();
+loc.Process(pcm_or_float_interleaved, num_frames, 3);
+
+SpacemitAudio::MultiSoundLocatorResult result = loc.GetResult();
+if (result.valid) {
+    printf("azimuth: %.1f\n", result.azimuth_deg);
+}
+```
+
+**Python API 概览**：
+
+```python
+from spacemit_audio_process import MultiSoundLocator
+
+cfg = MultiSoundLocator.create_equilateral_triangle_config(0.063)
+loc = MultiSoundLocator(cfg)
+loc.initialize()
+loc.process(samples_float32_n_frames_by_3)
+print(loc.result.azimuth_deg, loc.result.confidence)
+```
+
+**默认等边三角形几何**：质心在原点，`mic0` 位于机器人前方 `+x`，`mic1/mic2` 位于后方左右两侧，边长默认 `0.063 m`。
+
+```text
+                 +x forward / 0 deg
+                       mic0
+                        *
+                       / \
+                      /   \
+             mic1 *---+---* mic2
+                  +y       -y
+```
+
+| 约定/参数 | 含义 |
+|-----------|------|
+| `MicrophonePosition{x, y, z}` | 单位米；v1 只使用 `x/y`，`z` 保留给未来俯仰角 |
+| `microphones` | 麦克风坐标数组；v1 支持并验证 `N=3` 等边三角，`N>3` 仅为实验性 |
+| `azimuth_deg` | 输出范围 `[0°, 360°)` |
+| `0°` | 机器人前方 `+x` |
+| 正方向 | 逆时针 CCW |
+| `azimuth_offset_deg` | 将阵列坐标系旋转到机器人坐标系的运行时偏移 |
+| `max_frequency_hz` | GCC-PHAT 频带上限；`0` 自动取 `c / (2 * d_max)`，等边 `0.063 m` 时约 `2.72 kHz` |
+| `score_margin` | MPCC-LSQ 中为未归一化波前向量范数，接近 `1` 表示 TDOA 互相一致 |
+| `valid_pairs` | GCC 峰值超过置信度阈值的麦克风对数量 |
+
+**合成信号验证命令**：
+
+```bash
+# C++：12 点扫角
+./build/bin/multi_ssl_demo -t --geometry equilateral --mic-distance 0.063 --sweep 0:330:30
+
+# C++：前后向区分
+./build/bin/multi_ssl_demo -t --angle 45
+./build/bin/multi_ssl_demo -t --angle 315
+
+# Python：默认验收角度集合
+python python/examples/multi_ssl_demo.py -t -d 0.063
+```
+
+**已知限制**：
+
+- v1 只估计平面方位角，不估计 elevation；`MicrophonePosition.z` 暂不参与计算。
+- v1 验证目标是 `N=3` 等边三角阵列；实现循环对 `N>3` 保持通用，但未做真实数据或系统验收。
+- `multi_ssl_demo -f` 已支持 3 声道 PCM16 WAV 输入，但当前没有已标注的真实录音回归集。
+- 如果 `score_margin` 明显偏低或 `valid_pairs` 长期不足，优先检查通道映射、麦克风坐标、平面波假设以及声源是否处于强混响环境。
+
+
 ## 4. 常见问题
 
 **Q: 端火角（0°/180°附近）误差很大？**

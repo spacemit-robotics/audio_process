@@ -9,12 +9,49 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
 #include "doa_service.h"
+#include "multi_sound_locator.h"
 
 namespace py = pybind11;
 
+using SpacemitAudio::MicrophonePosition;
+using SpacemitAudio::MultiSoundLocator;
+using SpacemitAudio::MultiSoundLocatorConfig;
+using SpacemitAudio::MultiSoundLocatorResult;
 using SpacemitAudio::SoundLocator;
 using SpacemitAudio::SoundLocatorConfig;
+
+namespace {
+
+std::vector<MicrophonePosition> ParseMicrophones(py::iterable items) {
+    std::vector<MicrophonePosition> microphones;
+    for (py::handle item : items) {
+        try {
+            microphones.push_back(item.cast<MicrophonePosition>());
+            continue;
+        } catch (const py::cast_error&) {
+        }
+
+        py::sequence seq = py::reinterpret_borrow<py::sequence>(item);
+        if (py::len(seq) < 2) {
+            throw std::runtime_error(
+                "microphones entries must be MicrophonePosition or (x, y[, z])");
+        }
+        MicrophonePosition mic;
+        mic.x = seq[0].cast<float>();
+        mic.y = seq[1].cast<float>();
+        mic.z = py::len(seq) >= 3 ? seq[2].cast<float>() : 0.0f;
+        microphones.push_back(mic);
+    }
+    return microphones;
+}
+
+}  // namespace
 
 // Wrapper to accept numpy arrays
 class PySoundLocator {
@@ -88,6 +125,147 @@ private:
     SoundLocator loc_;
 };
 
+class PyMultiSoundLocator {
+public:
+    explicit PyMultiSoundLocator(const MultiSoundLocatorConfig& config = {})
+        : loc_(config) {}
+
+    bool initialize() { return loc_.Initialize(); }
+    void reset() { loc_.Reset(); }
+
+    bool process_float(
+        py::array_t<float, py::array::c_style | py::array::forcecast> samples,
+        int n_channels = 0) {
+        auto buf = samples.request();
+        const auto* ptr = static_cast<const float*>(buf.ptr);
+        size_t n_frames = 0;
+        int channels = n_channels;
+
+        if (buf.ndim == 2) {
+            n_frames = static_cast<size_t>(buf.shape[0]);
+            const int array_channels = static_cast<int>(buf.shape[1]);
+            if (channels == 0) {
+                channels = array_channels;
+            } else if (channels != array_channels) {
+                throw std::runtime_error(
+                    "n_channels does not match the second ndarray dimension");
+            }
+        } else if (buf.ndim == 1) {
+            if (channels <= 0) {
+                throw std::runtime_error(
+                    "n_channels is required for 1-D interleaved arrays");
+            }
+            const size_t total = static_cast<size_t>(buf.shape[0]);
+            if (total % static_cast<size_t>(channels) != 0) {
+                throw std::runtime_error(
+                    "interleaved array length must be divisible by n_channels");
+            }
+            n_frames = total / static_cast<size_t>(channels);
+        } else {
+            throw std::runtime_error(
+                "expected a 1-D interleaved array or a 2-D (frames, channels) array");
+        }
+
+        py::gil_scoped_release release;
+        return loc_.Process(ptr, n_frames, channels);
+    }
+
+    bool process_int16(
+        py::array_t<int16_t, py::array::c_style | py::array::forcecast> samples,
+        int n_channels = 0) {
+        auto buf = samples.request();
+        const auto* ptr = static_cast<const int16_t*>(buf.ptr);
+        size_t n_frames = 0;
+        int channels = n_channels;
+
+        if (buf.ndim == 2) {
+            n_frames = static_cast<size_t>(buf.shape[0]);
+            const int array_channels = static_cast<int>(buf.shape[1]);
+            if (channels == 0) {
+                channels = array_channels;
+            } else if (channels != array_channels) {
+                throw std::runtime_error(
+                    "n_channels does not match the second ndarray dimension");
+            }
+        } else if (buf.ndim == 1) {
+            if (channels <= 0) {
+                throw std::runtime_error(
+                    "n_channels is required for 1-D interleaved arrays");
+            }
+            const size_t total = static_cast<size_t>(buf.shape[0]);
+            if (total % static_cast<size_t>(channels) != 0) {
+                throw std::runtime_error(
+                    "interleaved array length must be divisible by n_channels");
+            }
+            n_frames = total / static_cast<size_t>(channels);
+        } else {
+            throw std::runtime_error(
+                "expected a 1-D interleaved array or a 2-D (frames, channels) array");
+        }
+
+        py::gil_scoped_release release;
+        return loc_.Process(ptr, n_frames, channels);
+    }
+
+    bool process_channels(py::sequence channels) {
+        const int n_channels = static_cast<int>(py::len(channels));
+        if (n_channels <= 0) {
+            throw std::runtime_error("expected at least one channel array");
+        }
+
+        channel_arrays_.clear();
+        channel_arrays_.reserve(n_channels);
+        channel_ptrs_.clear();
+        channel_ptrs_.reserve(n_channels);
+
+        size_t n_frames = 0;
+        for (int ch = 0; ch < n_channels; ++ch) {
+            py::object item = channels[ch];
+            auto array = py::array_t<
+                float, py::array::c_style | py::array::forcecast>::ensure(
+                    item);
+            if (!array) {
+                throw std::runtime_error("channel entries must be float arrays");
+            }
+            channel_arrays_.push_back(array);
+            auto buf = channel_arrays_.back().request();
+            if (buf.ndim != 1) {
+                throw std::runtime_error("channel arrays must be 1-D");
+            }
+            if (ch == 0) {
+                n_frames = static_cast<size_t>(buf.shape[0]);
+            } else if (n_frames != static_cast<size_t>(buf.shape[0])) {
+                throw std::runtime_error("all channel arrays must have same length");
+            }
+            channel_ptrs_.push_back(static_cast<const float*>(buf.ptr));
+        }
+
+        py::gil_scoped_release release;
+        return loc_.Process(channel_ptrs_.data(), n_frames, n_channels);
+    }
+
+    MultiSoundLocatorResult get_result() const { return loc_.GetResult(); }
+    float get_azimuth() const { return loc_.GetAzimuth(); }
+    float get_confidence() const { return loc_.GetConfidence(); }
+    bool is_valid() const { return loc_.IsValid(); }
+    float get_average_azimuth() const { return loc_.GetAverageAzimuth(); }
+    int get_result_count() const { return loc_.GetResultCount(); }
+    float get_tdoa(int i, int j) const { return loc_.GetTDOA(i, j); }
+    int get_max_delay_samples_pair(int i, int j) const {
+        return loc_.GetMaxDelaySamplesPair(i, j);
+    }
+    MultiSoundLocatorConfig get_config() const { return loc_.GetConfig(); }
+
+    PyMultiSoundLocator& enter() { return *this; }
+    void exit(py::object, py::object, py::object) { reset(); }
+
+private:
+    MultiSoundLocator loc_;
+    std::vector<py::array_t<float, py::array::c_style | py::array::forcecast>>
+        channel_arrays_;
+    std::vector<const float*> channel_ptrs_;
+};
+
 PYBIND11_MODULE(_spacemit_audio_process, m) {
     m.doc() = "Sound source localization (GCC-PHAT)";
 
@@ -138,4 +316,100 @@ PYBIND11_MODULE(_spacemit_audio_process, m) {
         .def("__enter__", &PySoundLocator::enter,
             py::return_value_policy::reference)
         .def("__exit__", &PySoundLocator::exit);
+
+    py::class_<MicrophonePosition>(m, "MicrophonePosition")
+        .def(py::init([](float x, float y, float z) {
+            return MicrophonePosition{x, y, z};
+        }), py::arg("x"), py::arg("y"), py::arg("z") = 0.0f)
+        .def_readwrite("x", &MicrophonePosition::x)
+        .def_readwrite("y", &MicrophonePosition::y)
+        .def_readwrite("z", &MicrophonePosition::z)
+        .def("__repr__", [](const MicrophonePosition& p) {
+            return "<MicrophonePosition x=" + std::to_string(p.x)
+                + " y=" + std::to_string(p.y)
+                + " z=" + std::to_string(p.z) + ">";
+        });
+
+    py::class_<MultiSoundLocatorConfig>(m, "MultiSoundLocatorConfig")
+        .def(py::init<>())
+        .def_readwrite("sample_rate", &MultiSoundLocatorConfig::sample_rate)
+        .def_readwrite("frame_size", &MultiSoundLocatorConfig::frame_size)
+        .def_readwrite("avg_frames", &MultiSoundLocatorConfig::avg_frames)
+        .def_readwrite("fft_size", &MultiSoundLocatorConfig::fft_size)
+        .def_readwrite("upsample_factor", &MultiSoundLocatorConfig::upsample_factor)
+        .def_readwrite("confidence_threshold",
+            &MultiSoundLocatorConfig::confidence_threshold)
+        .def_readwrite("sound_speed", &MultiSoundLocatorConfig::sound_speed)
+        .def_readwrite("use_fftw_measure",
+            &MultiSoundLocatorConfig::use_fftw_measure)
+        .def_property("microphones",
+            [](const MultiSoundLocatorConfig& c) { return c.microphones; },
+            [](MultiSoundLocatorConfig& c, py::iterable items) {
+                c.microphones = ParseMicrophones(items);
+            })
+        .def_readwrite("azimuth_offset_deg",
+            &MultiSoundLocatorConfig::azimuth_offset_deg)
+        .def_readwrite("max_frequency_hz",
+            &MultiSoundLocatorConfig::max_frequency_hz)
+        .def_readwrite("search_step_deg",
+            &MultiSoundLocatorConfig::search_step_deg)
+        .def_readwrite("margin_threshold",
+            &MultiSoundLocatorConfig::margin_threshold)
+        .def_readwrite("max_avg_seconds",
+            &MultiSoundLocatorConfig::max_avg_seconds)
+        .def("__repr__", [](const MultiSoundLocatorConfig& c) {
+            return "<MultiSoundLocatorConfig sr=" + std::to_string(c.sample_rate)
+                + " channels=" + std::to_string(c.microphones.size())
+                + " frame=" + std::to_string(c.frame_size)
+                + " avg=" + std::to_string(c.avg_frames) + ">";
+        });
+
+    py::class_<MultiSoundLocatorResult>(m, "MultiSoundLocatorResult")
+        .def(py::init<>())
+        .def_readwrite("azimuth_deg", &MultiSoundLocatorResult::azimuth_deg)
+        .def_readwrite("confidence", &MultiSoundLocatorResult::confidence)
+        .def_readwrite("peak_score", &MultiSoundLocatorResult::peak_score)
+        .def_readwrite("score_margin", &MultiSoundLocatorResult::score_margin)
+        .def_readwrite("valid_pairs", &MultiSoundLocatorResult::valid_pairs)
+        .def_readwrite("valid", &MultiSoundLocatorResult::valid)
+        .def("__repr__", [](const MultiSoundLocatorResult& r) {
+            return "<MultiSoundLocatorResult azimuth="
+                + std::to_string(r.azimuth_deg)
+                + " confidence=" + std::to_string(r.confidence)
+                + " valid=" + std::to_string(r.valid) + ">";
+        });
+
+    py::class_<PyMultiSoundLocator>(m, "MultiSoundLocator")
+        .def(py::init<const MultiSoundLocatorConfig&>(),
+            py::arg("config") = MultiSoundLocatorConfig{})
+        .def_static("create_equilateral_triangle_config",
+            &MultiSoundLocator::CreateEquilateralTriangleConfig,
+            py::arg("side_length_m") = 0.063f)
+        .def("initialize", &PyMultiSoundLocator::initialize)
+        .def("reset", &PyMultiSoundLocator::reset)
+        .def("process", &PyMultiSoundLocator::process_float,
+            py::arg("samples"), py::arg("n_channels") = 0,
+            "Process float32 data as (frames, channels) or 1-D interleaved")
+        .def("process_int16", &PyMultiSoundLocator::process_int16,
+            py::arg("samples"), py::arg("n_channels") = 0,
+            "Process int16 data as (frames, channels) or 1-D interleaved")
+        .def("process_channels", &PyMultiSoundLocator::process_channels,
+            py::arg("channels"),
+            "Process a sequence of separate float32 channel arrays")
+        .def_property_readonly("result", &PyMultiSoundLocator::get_result)
+        .def_property_readonly("azimuth", &PyMultiSoundLocator::get_azimuth)
+        .def_property_readonly("confidence", &PyMultiSoundLocator::get_confidence)
+        .def_property_readonly("is_valid", &PyMultiSoundLocator::is_valid)
+        .def_property_readonly("average_azimuth",
+            &PyMultiSoundLocator::get_average_azimuth)
+        .def_property_readonly("result_count", &PyMultiSoundLocator::get_result_count)
+        .def_property_readonly("config", &PyMultiSoundLocator::get_config)
+        .def("get_tdoa", &PyMultiSoundLocator::get_tdoa,
+            py::arg("i"), py::arg("j"))
+        .def("get_max_delay_samples_pair",
+            &PyMultiSoundLocator::get_max_delay_samples_pair,
+            py::arg("i"), py::arg("j"))
+        .def("__enter__", &PyMultiSoundLocator::enter,
+            py::return_value_policy::reference)
+        .def("__exit__", &PyMultiSoundLocator::exit);
 }

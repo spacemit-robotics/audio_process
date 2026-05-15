@@ -56,6 +56,8 @@ endif()
 # -------------------------------------------------------
 set(SOUND_LOCATOR_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sound_locator.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gcc_phat_pair.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/multi_sound_locator.cpp
 )
 
 if(AUDIO_PROCESS_SHARED)
@@ -94,20 +96,31 @@ if(AUDIO_PROCESS_BUILD_EXAMPLES)
 
     target_link_libraries(ssl_demo PRIVATE sound_locator m)
 
+    add_executable(multi_ssl_demo
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/multi_ssl_demo.cpp
+    )
+
+    target_link_libraries(multi_ssl_demo PRIVATE sound_locator m)
+
     # Try to find spacemit_audio for live-capture mode
     find_library(SPACE_AUDIO_LIB NAMES spacemit_audio)
     find_path(SPACE_AUDIO_INC NAMES audio_base.hpp)
 
     if(SPACE_AUDIO_LIB AND SPACE_AUDIO_INC)
         target_compile_definitions(ssl_demo PRIVATE HAS_SPACEMIT_AUDIO)
+        target_compile_definitions(multi_ssl_demo PRIVATE HAS_SPACEMIT_AUDIO)
         target_include_directories(ssl_demo PRIVATE ${SPACE_AUDIO_INC})
+        target_include_directories(multi_ssl_demo PRIVATE ${SPACE_AUDIO_INC})
         target_link_libraries(ssl_demo PRIVATE ${SPACE_AUDIO_LIB})
+        target_link_libraries(multi_ssl_demo PRIVATE ${SPACE_AUDIO_LIB})
 
         # PortAudio (transitive dep of spacemit_audio)
         pkg_check_modules(PORTAUDIO portaudio-2.0)
         if(PORTAUDIO_FOUND)
             target_link_libraries(ssl_demo PRIVATE ${PORTAUDIO_LIBRARIES})
+            target_link_libraries(multi_ssl_demo PRIVATE ${PORTAUDIO_LIBRARIES})
             target_link_directories(ssl_demo PRIVATE ${PORTAUDIO_LIBRARY_DIRS})
+            target_link_directories(multi_ssl_demo PRIVATE ${PORTAUDIO_LIBRARY_DIRS})
         endif()
         message(STATUS "[audio_process] ssl_demo: live mode enabled (spacemit_audio found)")
     else()
@@ -117,8 +130,12 @@ if(AUDIO_PROCESS_BUILD_EXAMPLES)
     set_target_properties(ssl_demo PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
+    set_target_properties(multi_ssl_demo PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
 
     message(STATUS "[audio_process] ssl_demo enabled")
+    message(STATUS "[audio_process] multi_ssl_demo enabled")
 endif()
 
 # -------------------------------------------------------
@@ -157,10 +174,18 @@ if(AUDIO_PROCESS_BUILD_PYTHON)
             message(STATUS "[audio_process] Python bindings enabled (${Python3_EXECUTABLE})")
 
             file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/spacemit_audio_process/__init__.py"
-                "from ._spacemit_audio_process import SoundLocator, SoundLocatorConfig\n"
+                "from ._spacemit_audio_process import (\n"
+                "    SoundLocator, SoundLocatorConfig,\n"
+                "    MicrophonePosition, MultiSoundLocatorConfig,\n"
+                "    MultiSoundLocatorResult, MultiSoundLocator,\n"
+                ")\n"
                 "\n"
-                "__all__ = ['SoundLocator', 'SoundLocatorConfig']\n"
-                "__version__ = '${PROJECT_VERSION}'\n"
+                "__all__ = [\n"
+                "    \"SoundLocator\", \"SoundLocatorConfig\",\n"
+                "    \"MicrophonePosition\", \"MultiSoundLocatorConfig\",\n"
+                "    \"MultiSoundLocatorResult\", \"MultiSoundLocator\",\n"
+                "]\n"
+                "__version__ = \"${PROJECT_VERSION}\"\n"
             )
             execute_process(
                 COMMAND ${Python3_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_path('platlib'))"
@@ -200,13 +225,15 @@ install(
 )
 
 install(
-    FILES ${CMAKE_CURRENT_SOURCE_DIR}/include/doa_service.h
+    FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/doa_service.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/multi_sound_locator.h
     DESTINATION ${AP_INSTALL_INCLUDEDIR}
 )
 
 if(AUDIO_PROCESS_BUILD_EXAMPLES)
     install(
-        TARGETS ssl_demo
+        TARGETS ssl_demo multi_ssl_demo
         RUNTIME DESTINATION ${AP_INSTALL_BINDIR}
     )
 endif()
