@@ -176,6 +176,12 @@ public:
     float GetDOA() const;
 
     /// Peak value of the normalised GCC function, range [0, 1].
+    /// 2-channel SoundLocator is full-band (active_bins = padded/2+1) so the
+    /// raw peak is already ≈ 1.0 for a clean source — bit-stable, unchanged
+    /// across releases. Multi-channel MultiSoundLocator may band-limit
+    /// internally; its per-pair peak is active-bin normalized (P1.1) so the
+    /// same `confidence_threshold = 0.1` carries the same significance
+    /// across mic geometries.
     float GetConfidence() const;
 
     /// True when GetConfidence() >= confidence_threshold.
@@ -251,10 +257,20 @@ struct MultiSoundLocatorConfig {
     /// 0 disables this gate; 0.5 is the AI-variant default if you opt in.
     float quality_threshold = 0.0f;
 
-    /// [A2] Max |tau_01 + tau_12 - tau_02| in samples for valid result.
-    /// Only enforced when N = 3. 2.0 ~= +-125 us at 16 kHz. Set <= 0 to
-    /// disable this gate.
-    float closure_threshold_samples = 2.0f;
+    /// [A2/P1.1] Closure-residual gate (N = 3 only). Effective threshold
+    /// in samples = max(closure_threshold_samples,
+    ///                   closure_threshold_fraction * max_physical_TDOA_samples),
+    /// where max_physical_TDOA_samples = max_pair_distance / sound_speed
+    /// * sample_rate. Both <= 0 disables the gate.
+    ///
+    /// Defaults (P1.1 evolve 2026-05-16): samples = 0.0 (disabled standalone),
+    /// fraction = 0.3 (~= 30% of max physical TDOA). Array-scale invariant:
+    /// e.g. 0.063m@16kHz physical_max ≈ 2.94 samples → effective ≈ 0.88
+    /// samples; 0.21m@16kHz physical_max ≈ 9.79 samples → effective ≈ 2.94
+    /// samples. Pre-P1.1 default 2.0 samples was scale-sensitive (= 68%
+    /// of physical for 0.063m array, effectively no rejection).
+    float closure_threshold_samples = 0.0f;
+    float closure_threshold_fraction = 0.3f;
 
     /// Speed of sound (m/s).
     float sound_speed = 343.0f;
@@ -285,9 +301,13 @@ struct MultiSoundLocatorResult {
     /// Robot-frame azimuth in [0, 360).
     float azimuth_deg = 0.0f;
 
-    /// [A4] geometric-mean of pair GCC peaks x quality. Penalises a single
-    /// dead pair instead of letting two strong pairs mask it (the failure
-    /// mode of the old arithmetic mean). Used by `valid`.
+    /// [A4/P1.1] geometric-mean of pair GCC peaks x quality. Pair peaks are
+    /// active-bin normalized (P1.1) so they ≈ 1.0 for a clean source
+    /// regardless of fft_size / max_frequency_hz / mic-array. Penalises a
+    /// single dead pair instead of letting two strong pairs mask it (the
+    /// failure mode of the old arithmetic mean). Used by `valid`. Same
+    /// `confidence_threshold` (default 0.1) now means the same significance
+    /// level across 2-ch and multi-ch paths.
     float confidence = 0.0f;
 
     /// Backward-compat: arithmetic mean of pair GCC peaks (the pre-A4

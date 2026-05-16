@@ -220,7 +220,8 @@ target_link_libraries(your_target PRIVATE sound_locator)
 | `max_frequency_hz` | `float` | `0.0` | GCC-PHAT 频带上限；`0` = 自动取 `c / (2 × d_max)` alias-safe（等边 0.063 m 时约 2.72 kHz） |
 | `margin_threshold` | `float` | `0.6` | `‖k̂_unnorm‖` 下限（raw norm 几何一致性）；静音/多源帧 `< 0.5` |
 | `quality_threshold` | `float` | `0.0` | [A5] clamped quality `1 − \|1 − ‖k̂‖\|` 下限；`0` 关闭此 gate；推荐严格场景 `0.5` |
-| `closure_threshold_samples` | `float` | `2.0` | [A2] `\|τ_01+τ_12-τ_02\|`（样本数）上限；**仅 N=3 启用**；`≤0` 关闭；16 kHz 下 2 sample ≈ ±125 µs |
+| `closure_threshold_samples` | `float` | `0.0` | [A2/P1.1] `\|τ_01+τ_12-τ_02\|`（样本数）显式上限；**仅 N=3 启用**；与 `closure_threshold_fraction` 取 max 后作为实际 gate；两者皆 `≤0` 关闭。**v1.1.1 BREAKING**：默认从 `2.0` 改为 `0.0`（fraction 接管）。|
+| `closure_threshold_fraction` | `float` | `0.3` | [A2/P1.1] `\|closure\| / max_physical_TDOA` 上限分数；**仅 N=3 启用**；阵列尺度无关（0.063 m@16 kHz → effective ≈ 0.88 sample；0.21 m@16 kHz → effective ≈ 2.94 sample）。**v1.1.1 新字段**。|
 
 **`MultiSoundLocatorResult` 新增字段**：
 
@@ -338,6 +339,38 @@ if result.confidence >= 0.17:   # ← 之前是 0.20 的话，先按 ~0.85× 试
     use(result.azimuth_deg)
 ```
 
+### 3.5.1 v1.1.1 升级注意（P1.1 BREAKING，multi 路径，2-ch 不变）
+
+v1.1.1 修复两个 scale-drift 问题。**只影响 `MultiSoundLocator` (multi 路径)，2-ch `SoundLocator` 保持 bit-stable，无任何 behavior 变化。**
+
+**BREAKING #1 — multi confidence 量纲改变 (~3× 提升)**：之前 multi 路径的 pair GCC 峰值是 raw IFFT 峰 × `1/padded_size`，量纲依赖 active bin 数。0.063 m 阵列 @16 kHz 带限 2.72 kHz → 175 active bins → 理想 peak ≈ 0.34（不是 header 文档说的 ≈1.0）。v1.1.1 起每对峰按 `(2·active_bins − 1) / padded_size` 归一化，clean 源 ≈ 1.0，跨 fft_size / band_limit / mic 几何 invariant。
+
+由于 multi `confidence = geometric_mean(pair_peaks) × quality`，pair 峰提升 ~3× 后 `confidence` 整体也 ~2.5–3× 增加。**§3.5 给的 0.17 / 0.20 阈值建议作废**；如果你之前用 v1.1 的 multi 路径并调过阈值：
+
+```python
+# 方案 A（推荐）：阈值乘 ~3 (实际乘 1/old_ideal_peak = padded_size / (2*active_bins - 1))
+# 0.063 m@16 kHz padded=1024 → 乘 1024/(2*175-1) ≈ 2.93
+if result.confidence >= 0.50:   # 之前 v1.1 multi 是 0.17 的话
+    use(result.azimuth_deg)
+
+# 方案 B：直接用默认 0.1 (多数场景已经够严格)
+config.confidence_threshold = 0.1   # multi 路径默认
+```
+
+**BREAKING #2 — closure_threshold 默认从 samples 转 fraction**：之前 `closure_threshold_samples = 2.0`（固定 samples）在 0.063 m@16 kHz 是 max physical TDOA 的 ~68%，几乎无 prune 作用。v1.1.1 默认 `samples = 0.0`、`fraction = 0.3`，effective = `max(samples, fraction * max_physical_TDOA_samples)`，阵列尺度 invariant。
+
+迁移策略：
+```python
+# 方案 A（推荐）：用新默认 fraction-based gate
+# 0.063 m@16 kHz → effective ≈ 0.88 sample
+# 0.21 m@16 kHz → effective ≈ 2.94 sample
+# 想 disable: 显式 samples=0, fraction=0
+
+# 方案 B：保留原 v1.1 行为（gate 几乎不生效）
+config.closure_threshold_samples = 2.0
+config.closure_threshold_fraction = 0.0   # 显式关 fraction，回到固定 samples
+```
+
 新增可观测性字段（pybind 全部暴露）：
 
 | C++ | Python | 含义 |
@@ -353,7 +386,8 @@ if result.confidence >= 0.17:   # ← 之前是 0.20 的话，先按 ~0.85× 试
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `closure_threshold_samples` | `2.0` | N=3 时 TDOA 闭环残差上限（样本数）；`≤0` 关闭 |
+| `closure_threshold_samples` | `0.0`（v1.1.1 起；原 v1.1 `2.0`） | N=3 时 TDOA 闭环残差显式上限（样本数）；与 `fraction` 取 max |
+| `closure_threshold_fraction` | `0.3`（v1.1.1 新增） | N=3 时 `\|closure\|/max_physical_TDOA` 上限；阵列尺度 invariant |
 | `quality_threshold` | `0.0` | clamped quality 下限；`0` 关闭此 gate |
 
 **已知限制**：
@@ -398,6 +432,7 @@ if result.confidence >= 0.17:   # ← 之前是 0.20 的话，先按 ~0.85× 试
 | ------ | ---- |
 | 1.0.0  | 提供 C++ / Python 接口，支持 GCC-PHAT 双声道声源定位。 |
 | 1.1.0  | 新增 `MultiSoundLocator`（3+ 声道平面 MPCC-LSQ，azimuth ∈ [0°, 360°)）；C++ + Python 两端的 `ssl_demo` 合并为单一 binary / 脚本（按 `-c N` 路由）；暴露 closure / quality / pair_confidences / average_resultant_length 等新可观测性字段；公开头文件合并为 `doa_service.h` 一个；demo CLI 暴露 `--quality-threshold` / `--margin-threshold` / `--closure-threshold-samples` / `--max-frequency-hz`；缺 `-d` 时打 stderr 警告。**BREAKING**: `MultiSoundLocatorResult.confidence` 改为几何平均 × quality（旧的算术平均保留为 `peak_score`）。详细迁移见 §3.5。 |
+| 1.1.1  | Runtime-safety 修复（multi 路径独立 BREAKING；2-ch `SoundLocator` 保持 bit-stable 不变）。**BREAKING #1**：multi 每对 GCC 峰按 `(2·active_bins − 1) / padded_size` 归一化（之前 raw 值随 fft_size / band_limit / mic 几何漂移），clean 源 ≈ 1.0 跨配置 invariant；multi `confidence` 整体 ~2.5–3× 提升，§3.5 的 0.17/0.20 阈值建议作废，迁移见 §3.5.1。**BREAKING #2**：`closure_threshold_samples` 默认从 `2.0` 改为 `0.0`，新增 `closure_threshold_fraction = 0.3`（effective = `max(samples, fraction × max_physical_TDOA_samples)`），阵列尺度 invariant；显式保留旧 behavior 见 §3.5.1。**修复**：Python 2-ch wrappers (`process_float` / `process_int16` / `process_separate`) 加 `c_style \| forcecast` flag 防 strided / fortran array silent-read 错位（与 multi wrappers 一致）；multi `Process` 改用 buffer reuse（`resize` 替代每次 `assign`），稳态零 realloc，匹配 2-ch `buf_a/buf_b` 模式，机器人 16 kHz 连续回调下音频线程零抖动。**新字段**：`MultiSoundLocatorConfig::closure_threshold_fraction`（pybind 暴露 `cfg.closure_threshold_fraction`）。 |
 
 ## 6. 贡献方式
 

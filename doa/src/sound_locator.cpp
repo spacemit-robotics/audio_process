@@ -277,6 +277,13 @@ bool SoundLocator::Impl::FindPeakAndConvert() {
     sin_theta = std::max(-1.0f, std::min(1.0f, sin_theta));
     doa = 90.0f - std::asin(sin_theta) * 180.0f / static_cast<float>(M_PI);
 
+    // 2-ch path is full-band: active_bins = spectrum_size = padded/2+1, so
+    // ideal_peak = (padded+1)/padded ≈ 1.0 already — scale-invariant w.r.t.
+    // fft_size by construction. No P1.1 normalization needed; preserves the
+    // doa_service.h:11 "2-channel SoundLocator is preserved bit-stable
+    // across releases" contract. P1.1 normalization is only applied on the
+    // band-limited multi path (gcc_phat_pair.cpp) where active_bins varies
+    // with band-limit / mic geometry.
     confidence = peak_val;
     valid = (confidence >= config.confidence_threshold);
 

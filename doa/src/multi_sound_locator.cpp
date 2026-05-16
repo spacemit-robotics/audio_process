@@ -118,6 +118,13 @@ struct MultiSoundLocator::Impl {
     std::vector<float> int16_float_buffer;
     std::vector<const float*> channel_view;
 
+    // [P1.1] Effective closure threshold (samples), computed once at
+    // Initialize from max(config.closure_threshold_samples,
+    // config.closure_threshold_fraction * max_physical_TDOA_samples).
+    // Cached so SolveReadyPairs is array-scale invariant without
+    // recomputing per call.
+    float effective_closure_samples = 0.0f;
+
     bool initialized = false;
 
     void DestroyFFT();
@@ -185,6 +192,19 @@ bool MultiSoundLocator::Impl::BuildGeometry() {
     if (config.max_frequency_hz <= 0.0f) {
         config.max_frequency_hz = config.sound_speed / (2.0f * max_pair_distance);
     }
+
+    // [P1.1] Derive array-scale-invariant closure threshold once at init.
+    // max_physical_TDOA_samples = max_pair_distance / sound_speed * sample_rate.
+    // Effective threshold = max(explicit samples, fraction * physical_max).
+    // Both <= 0 disables the gate entirely.
+    const float max_physical_tdoa_samples = (config.sound_speed > 0.0f)
+        ? (max_pair_distance / config.sound_speed
+           * static_cast<float>(config.sample_rate))
+        : 0.0f;
+    const float from_fraction = std::max(0.0f, config.closure_threshold_fraction)
+                              * max_physical_tdoa_samples;
+    const float from_samples = std::max(0.0f, config.closure_threshold_samples);
+    effective_closure_samples = std::max(from_samples, from_fraction);
 
     float ata00 = 0.0f;
     float ata01 = 0.0f;
@@ -367,8 +387,11 @@ bool MultiSoundLocator::Impl::SolveReadyPairs() {
         closure_sec = latest_tdoa[0] + latest_tdoa[2] - latest_tdoa[1];
         const float abs_sec = std::fabs(closure_sec);
         closure_samples = abs_sec * static_cast<float>(config.sample_rate);
-        if (config.closure_threshold_samples > 0.0f) {
-            closure_ok = closure_samples <= config.closure_threshold_samples;
+        // [P1.1] Use effective_closure_samples (computed once at init from
+        // max(closure_threshold_samples, fraction * max_physical_TDOA)) so
+        // the gate is array-scale invariant.
+        if (effective_closure_samples > 0.0f) {
+            closure_ok = closure_samples <= effective_closure_samples;
         }
     }
 
@@ -379,11 +402,15 @@ bool MultiSoundLocator::Impl::SolveReadyPairs() {
     result.quality = quality;
     result.closure_residual_sec = std::fabs(closure_sec);
     result.valid_pairs = valid_pairs_count;
-    // valid: existing gates (confidence + margin) plus new gates (quality
-    // floor + closure for N=3). Both new gates default-to-disabled
-    // (quality_threshold=0, closure_threshold_samples=2 with explicit
-    // N==3 guard) so the v1 behavior is preserved if the caller does not
-    // opt in to stricter validation.
+    // valid gates:
+    //   - confidence_threshold (P1.1 normalized, scale-invariant default 0.1)
+    //   - margin_threshold (default 0.6, geometry consistency)
+    //   - quality_threshold (default 0 = disabled; opt-in 0.5 if stricter)
+    //   - closure gate (N=3 only) via effective_closure_samples derived
+    //     from max(closure_threshold_samples, closure_threshold_fraction *
+    //     max_physical_TDOA). Pre-P1.1 `closure_threshold_samples=2.0` was
+    //     scale-sensitive; new default `samples=0.0, fraction=0.3` is
+    //     array-scale invariant.
     result.valid = confidence >= config.confidence_threshold
                 && norm >= config.margin_threshold
                 && quality >= config.quality_threshold
@@ -599,8 +626,16 @@ bool MultiSoundLocator::Process(
     }
     impl_->ValidateChannelCount(n_channels);
 
-    impl_->planar_buffers.assign(impl_->n_channels,
-        std::vector<float>(n_frames));
+    // Steady-state zero-realloc per-channel buffer reuse (matches 2-ch
+    // SoundLocator::Process buf_a/buf_b.resize() pattern; Initialize already
+    // assigned n_channels empty vectors, so subsequent resize is no-op once
+    // n_frames stabilizes).
+    if (static_cast<int>(impl_->planar_buffers.size()) != impl_->n_channels) {
+        impl_->planar_buffers.resize(impl_->n_channels);
+    }
+    for (int ch = 0; ch < impl_->n_channels; ++ch) {
+        impl_->planar_buffers[ch].resize(n_frames);
+    }
     for (size_t frame = 0; frame < n_frames; ++frame) {
         for (int ch = 0; ch < impl_->n_channels; ++ch) {
             impl_->planar_buffers[ch][frame] =
@@ -608,7 +643,9 @@ bool MultiSoundLocator::Process(
         }
     }
 
-    impl_->channel_view.resize(impl_->n_channels);
+    if (static_cast<int>(impl_->channel_view.size()) != impl_->n_channels) {
+        impl_->channel_view.resize(impl_->n_channels);
+    }
     for (int ch = 0; ch < impl_->n_channels; ++ch) {
         impl_->channel_view[ch] = impl_->planar_buffers[ch].data();
     }

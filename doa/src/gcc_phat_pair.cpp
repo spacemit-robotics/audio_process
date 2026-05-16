@@ -247,7 +247,23 @@ GccPhatPairResult GccPhatPair::IfftAndPeak() {
     result.delay_samples = up_delay / static_cast<float>(config_.upsample_factor);
     result.tdoa_seconds = result.delay_samples
         / static_cast<float>(config_.sample_rate);
-    result.peak_value = peak_val;
+    // [P1.1] Normalize peak so confidence is invariant to fft_size /
+    // band-limit. Ideal noise-free peak after IFFT * (1/padded_size) ≈
+    // (2 * active_bins - 1) / padded_size, where active_bins counts the
+    // PHAT-summed bins (including DC: indices 0..band_limit_bin_max_
+    // inclusive). Post-normalize, multi-channel peak_value ≈ 1.0 for a
+    // clean source and is meaningful to compare against the same
+    // confidence_threshold across different mic geometries / band limits.
+    // (2-ch SoundLocator is full-band so its raw peak is already ≈ 1.0
+    // by construction; it intentionally does NOT apply this normalization
+    // to preserve the bit-stable contract.)
+    const int active_bins = band_limit_bin_max_ + 1;
+    const float ideal_peak =
+        (2.0f * static_cast<float>(active_bins) - 1.0f)
+        / static_cast<float>(config_.padded_size);
+    result.peak_value = (ideal_peak > 1e-10f)
+        ? (peak_val / ideal_peak)
+        : peak_val;
 
     std::memset(phat_accumulator_, 0,
                 config_.spectrum_size * sizeof(fftwf_complex));
