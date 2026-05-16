@@ -15,7 +15,6 @@
 #include <vector>
 
 #include "doa_service.h"
-#include "multi_sound_locator.h"
 
 namespace py = pybind11;
 
@@ -256,6 +255,29 @@ public:
     }
     MultiSoundLocatorConfig get_config() const { return loc_.GetConfig(); }
 
+    // [A1] TDOA closure (N=3 only; 0 otherwise)
+    float get_closure_residual() const { return loc_.GetClosureResidual(); }
+    float get_closure_samples() const { return loc_.GetClosureSamples(); }
+    // [A5] clamped quality, [0, 1]
+    float get_quality() const { return loc_.GetQuality(); }
+    // [A6] Mardia mean resultant length, [0, 1]
+    float get_average_resultant_length() const {
+        return loc_.GetAverageResultantLength();
+    }
+    // [A3] per-pair GCC peak confidences
+    int get_pair_count() const { return loc_.GetPairCount(); }
+    py::array_t<float> get_pair_confidences() const {
+        const int n = loc_.GetPairCount();
+        py::array_t<float> arr(static_cast<py::ssize_t>(n));
+        if (n > 0) {
+            auto r = arr.mutable_unchecked<1>();
+            std::vector<float> buf(static_cast<size_t>(n));
+            loc_.GetPairConfidences(buf.data(), n);
+            for (int i = 0; i < n; ++i) r(i) = buf[static_cast<size_t>(i)];
+        }
+        return arr;
+    }
+
     PyMultiSoundLocator& enter() { return *this; }
     void exit(py::object, py::object, py::object) { reset(); }
 
@@ -357,6 +379,12 @@ PYBIND11_MODULE(_spacemit_audio_process, m) {
             &MultiSoundLocatorConfig::margin_threshold)
         .def_readwrite("max_avg_seconds",
             &MultiSoundLocatorConfig::max_avg_seconds)
+        // [A5] quality threshold (default 0.0 = disabled; v1 backward-compat)
+        .def_readwrite("quality_threshold",
+            &MultiSoundLocatorConfig::quality_threshold)
+        // [A2] TDOA closure threshold in samples (default 2.0; N=3 only)
+        .def_readwrite("closure_threshold_samples",
+            &MultiSoundLocatorConfig::closure_threshold_samples)
         .def("__repr__", [](const MultiSoundLocatorConfig& c) {
             return "<MultiSoundLocatorConfig sr=" + std::to_string(c.sample_rate)
                 + " channels=" + std::to_string(c.microphones.size())
@@ -370,6 +398,11 @@ PYBIND11_MODULE(_spacemit_audio_process, m) {
         .def_readwrite("confidence", &MultiSoundLocatorResult::confidence)
         .def_readwrite("peak_score", &MultiSoundLocatorResult::peak_score)
         .def_readwrite("score_margin", &MultiSoundLocatorResult::score_margin)
+        // [A5] clamped consistency in [0, 1]
+        .def_readwrite("quality", &MultiSoundLocatorResult::quality)
+        // [A1] |τ_01+τ_12-τ_02| in seconds (N=3 only; 0 otherwise)
+        .def_readwrite("closure_residual_sec",
+            &MultiSoundLocatorResult::closure_residual_sec)
         .def_readwrite("valid_pairs", &MultiSoundLocatorResult::valid_pairs)
         .def_readwrite("valid", &MultiSoundLocatorResult::valid)
         .def("__repr__", [](const MultiSoundLocatorResult& r) {
@@ -404,6 +437,21 @@ PYBIND11_MODULE(_spacemit_audio_process, m) {
             &PyMultiSoundLocator::get_average_azimuth)
         .def_property_readonly("result_count", &PyMultiSoundLocator::get_result_count)
         .def_property_readonly("config", &PyMultiSoundLocator::get_config)
+        // [A1] TDOA closure observability
+        .def_property_readonly("closure_residual",
+            &PyMultiSoundLocator::get_closure_residual)
+        .def_property_readonly("closure_samples",
+            &PyMultiSoundLocator::get_closure_samples)
+        // [A3] per-pair confidences
+        .def_property_readonly("pair_count",
+            &PyMultiSoundLocator::get_pair_count)
+        .def_property_readonly("pair_confidences",
+            &PyMultiSoundLocator::get_pair_confidences)
+        // [A5] clamped consistency
+        .def_property_readonly("quality", &PyMultiSoundLocator::get_quality)
+        // [A6] Mardia mean resultant length
+        .def_property_readonly("average_resultant_length",
+            &PyMultiSoundLocator::get_average_resultant_length)
         .def("get_tdoa", &PyMultiSoundLocator::get_tdoa,
             py::arg("i"), py::arg("j"))
         .def("get_max_delay_samples_pair",

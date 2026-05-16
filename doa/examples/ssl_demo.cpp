@@ -2,12 +2,29 @@
  * Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * ssl_demo — Sound Source Localization demo
+ * ssl_demo — unified Sound Source Localization demo (2-ch and 3-ch+)
  *
  * Usage:
- *   ssl_demo -t [-d mic_dist] [-r rate] [--flip]          Synthetic accuracy test
- *   ssl_demo -f <stereo.wav> [-d mic_dist] [-v] [--flip]  Process WAV file
- *   ssl_demo -l [-d mic_dist] [-r rate] [-i dev] [--flip] Live capture
+ *   ssl_demo -c 2 -t [-d M] [-r RATE] [--flip]
+ *   ssl_demo -c 2 -f stereo.wav [-d M] [-v] [--flip]
+ *   ssl_demo -c 2 -l [-d M] [-r RATE] [-i DEV] [--flip]
+ *
+ *   ssl_demo -c 3 -t [-d M] [--angle DEG] [--sweep A:B:S] [--noise-snr DB]
+ *                    [--azimuth-offset DEG] [--positions SPEC]
+ *                    [--avg-seconds S]
+ *                    [--quality-threshold F] [--margin-threshold F]
+ *                    [--closure-threshold-samples F] [--max-frequency-hz F]
+ *   ssl_demo -c 3 -f 3ch.wav [-d M] [-v] [--positions SPEC]
+ *                    [--azimuth-offset DEG] [--avg-seconds S]
+ *   ssl_demo -c 3 -l [-d M] [-r RATE] [-i DEV] [-v]
+ *                    [--positions SPEC] [--azimuth-offset DEG]
+ *                    [--avg-seconds S]
+ *
+ *   ssl_demo -h | --help
+ *
+ * Channel count is selected with -c N (N=2 dispatches to SoundLocator;
+ * N>=3 dispatches to MultiSoundLocator). For -f mode without -c, the WAV
+ * channel count is auto-detected.
  */
 
 #include <algorithm>
@@ -19,6 +36,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <string>
 #include <thread>
@@ -34,477 +52,961 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-static float ReportAngle(float doa, bool flip_angle) {
-    float angle = flip_angle ? 180.0f - doa : doa;
-    return std::max(0.0f, std::min(180.0f, angle));
-}
+// ===========================================================================
+// Shared helpers
+// ===========================================================================
 
-static void PrintAngleMapping(bool flip_angle) {
-    if (flip_angle) {
-        printf("Angle mapping: flipped (reported = 180 - raw DOA)\n");
-    }
-}
+namespace {
 
-// -----------------------------------------------------------------------
-// Minimal WAV reader (PCM16 only)
-// -----------------------------------------------------------------------
-struct WavHeader {
-    char riff[4];
-    uint32_t file_size;
-    char wave[4];
-    char fmt_id[4];
-    uint32_t fmt_size;
-    uint16_t audio_format;
-    uint16_t channels;
-    uint32_t sample_rate;
-    uint32_t byte_rate;
-    uint16_t block_align;
-    uint16_t bits_per_sample;
+constexpr int kLanczosTaps = 31;
+constexpr int kLanczosHalf = kLanczosTaps / 2;
+constexpr float kDefault2chMicDistance = 0.058f;
+constexpr float kDefault3chMicDistance = 0.063f;
+
+struct WavData {
+    std::vector<int16_t> samples;
+    int channels = 0;
+    int sample_rate = 0;
 };
 
-static bool ReadWav(const char* path, std::vector<int16_t>& samples,
-                    int& channels, int& sample_rate) {
-    FILE* f = fopen(path, "rb");
+float NormalizeAngle360(float degrees) {
+    float v = std::fmod(degrees, 360.0f);
+    if (v < 0.0f) v += 360.0f;
+    if (v >= 360.0f) v -= 360.0f;
+    return v;
+}
+
+float CircularError(float a, float b) {
+    float diff = std::fabs(NormalizeAngle360(a) - NormalizeAngle360(b));
+    return std::min(diff, 360.0f - diff);
+}
+
+// Read a PCM16 WAV of any channel count.
+bool ReadWav(const char* path, WavData& wav) {
+    FILE* f = std::fopen(path, "rb");
     if (!f) {
-        fprintf(stderr, "Cannot open %s\n", path);
+        std::fprintf(stderr, "Cannot open %s\n", path);
         return false;
     }
 
-    WavHeader hdr;
-    if (fread(&hdr, sizeof(hdr), 1, f) != 1) {
-        fclose(f);
+    char riff[4]; uint32_t riff_size = 0; char wave[4];
+    if (std::fread(riff, 1, 4, f) != 4
+        || std::fread(&riff_size, sizeof(riff_size), 1, f) != 1
+        || std::fread(wave, 1, 4, f) != 4
+        || std::memcmp(riff, "RIFF", 4) != 0
+        || std::memcmp(wave, "WAVE", 4) != 0) {
+        std::fclose(f);
+        std::fprintf(stderr, "Not a WAV file\n");
         return false;
     }
 
-    if (memcmp(hdr.riff, "RIFF", 4) || memcmp(hdr.wave, "WAVE", 4)) {
-        fprintf(stderr, "Not a WAV file\n"); fclose(f); return false;
-    }
-    if (hdr.audio_format != 1 || hdr.bits_per_sample != 16) {
-        fprintf(stderr, "Only PCM16 WAV is supported\n"); fclose(f); return false;
-    }
+    bool got_fmt = false;
+    uint16_t audio_format = 0, channels = 0, bits_per_sample = 0;
+    uint32_t sample_rate = 0;
 
-    channels = hdr.channels;
-    sample_rate = static_cast<int>(hdr.sample_rate);
+    while (!std::feof(f)) {
+        char chunk_id[4]; uint32_t chunk_size = 0;
+        if (std::fread(chunk_id, 1, 4, f) != 4
+            || std::fread(&chunk_size, sizeof(chunk_size), 1, f) != 1) break;
 
-    // Skip to "data" chunk
-    char chunk_id[4];
-    uint32_t chunk_size;
-    while (fread(chunk_id, 4, 1, f) == 1 && fread(&chunk_size, 4, 1, f) == 1) {
-        if (memcmp(chunk_id, "data", 4) == 0) {
-            size_t n = chunk_size / sizeof(int16_t);
-            samples.resize(n);
-            size_t read_count = fread(samples.data(), sizeof(int16_t), n, f);
-            fclose(f);
-            if (read_count != n) {
-                fprintf(stderr, "Failed to read WAV data\n");
+        if (std::memcmp(chunk_id, "fmt ", 4) == 0) {
+            if (chunk_size < 16) {
+                std::fclose(f);
+                return false;
+            }
+            uint32_t byte_rate = 0; uint16_t block_align = 0;
+            if (std::fread(&audio_format, sizeof(audio_format), 1, f) != 1
+                || std::fread(&channels, sizeof(channels), 1, f) != 1
+                || std::fread(&sample_rate, sizeof(sample_rate), 1, f) != 1
+                || std::fread(&byte_rate, sizeof(byte_rate), 1, f) != 1
+                || std::fread(&block_align, sizeof(block_align), 1, f) != 1
+                || std::fread(&bits_per_sample, sizeof(bits_per_sample), 1, f) != 1) {
+                std::fclose(f);
+                std::fprintf(stderr, "Failed to read WAV fmt chunk\n");
+                return false;
+            }
+            if (chunk_size > 16) {
+                std::fseek(f, static_cast<int64_t>(chunk_size - 16), SEEK_CUR);
+            }
+            got_fmt = true;
+        } else if (std::memcmp(chunk_id, "data", 4) == 0) {
+            if (!got_fmt) {
+                std::fclose(f);
+                std::fprintf(stderr, "WAV data chunk appeared before fmt\n");
+                return false;
+            }
+            if (audio_format != 1 || bits_per_sample != 16) {
+                std::fclose(f);
+                std::fprintf(stderr, "Only PCM16 WAV is supported\n");
+                return false;
+            }
+            wav.channels = static_cast<int>(channels);
+            wav.sample_rate = static_cast<int>(sample_rate);
+            wav.samples.resize(chunk_size / sizeof(int16_t));
+            const size_t got = std::fread(wav.samples.data(), sizeof(int16_t),
+                wav.samples.size(), f);
+            std::fclose(f);
+            if (got != wav.samples.size()) {
+                std::fprintf(stderr, "Failed to read WAV data\n");
                 return false;
             }
             return true;
+        } else {
+            std::fseek(f, static_cast<int64_t>(chunk_size), SEEK_CUR);
         }
-        fseek(f, chunk_size, SEEK_CUR);
+        if (chunk_size % 2 != 0) std::fseek(f, 1, SEEK_CUR);
     }
 
-    fclose(f);
-    fprintf(stderr, "No data chunk found\n");
+    std::fclose(f);
+    std::fprintf(stderr, "No data chunk found\n");
     return false;
 }
 
-// -----------------------------------------------------------------------
-// Synthetic test: generate delayed stereo signal, verify DOA accuracy
-// -----------------------------------------------------------------------
-static int RunTest(float mic_dist, int sample_rate, bool flip_angle) {
-    printf("=== Synthetic Accuracy Test ===\n");
-    printf("Mic distance: %.4f m | Sample rate: %d Hz\n\n", mic_dist, sample_rate);
-    PrintAngleMapping(flip_angle);
-    if (flip_angle) {
-        printf("\n");
+void WarnIfDefaultMicDistance(bool user_set, float used, const char* mode_tag) {
+    if (!user_set) {
+        std::fprintf(stderr,
+            "[ssl_demo] WARNING: -d / --mic-distance not set; using demo default "
+            "%.4f m for %s. Production code MUST measure and set the real "
+            "physical mic spacing — endfire angles fail silently otherwise.\n",
+            used, mode_tag);
     }
+}
+
+#ifdef HAS_SPACEMIT_AUDIO
+volatile std::sig_atomic_t g_stop_requested = 0;
+void HandleSignal(int) { g_stop_requested = 1; }
+#endif
+
+// ===========================================================================
+// 2-channel mode (SoundLocator)
+// ===========================================================================
+
+float ReportAngle2ch(float doa, bool flip) {
+    float a = flip ? 180.0f - doa : doa;
+    return std::max(0.0f, std::min(180.0f, a));
+}
+
+int RunTest_2ch(float mic_distance, int sample_rate, bool flip) {
+    std::printf("=== 2-ch Synthetic Accuracy Test ===\n");
+    std::printf("Mic distance: %.4f m | Sample rate: %d Hz\n\n",
+                mic_distance, sample_rate);
+    if (flip) std::printf("Angle mapping: flipped (reported = 180 - raw DOA)\n\n");
 
     SpacemitAudio::SoundLocatorConfig cfg;
     cfg.sample_rate = sample_rate;
-    cfg.mic_distance = mic_dist;
+    cfg.mic_distance = mic_distance;
     cfg.frame_size = 512;
     cfg.avg_frames = 4;
     cfg.confidence_threshold = 0.05f;
 
     SpacemitAudio::SoundLocator loc(cfg);
     if (!loc.Initialize()) {
-        fprintf(stderr, "Initialize failed\n");
+        std::fprintf(stderr, "Initialize failed\n");
         return 1;
     }
-
-    printf("Max delay: %d samples\n\n", loc.GetMaxDelaySamples());
+    std::printf("Max delay: %d samples\n\n", loc.GetMaxDelaySamples());
 
     const float c = cfg.sound_speed;
     const float fs = static_cast<float>(sample_rate);
     const int total_samples = cfg.frame_size * cfg.avg_frames;
-
-    // Windowed-sinc interpolation kernel half-width
     constexpr int kSincHalf = 16;
 
-    // Test angles in [0, 180] coordinate system
-    // 90° = broadside, 0° = endfire (ch1 side), 180° = endfire (ch0 side)
     const float test_angles[] = {
         90.0f, 85.0f, 80.0f, 75.0f, 70.0f, 60.0f, 45.0f, 30.0f, 15.0f, 0.0f,
         95.0f, 100.0f, 120.0f, 135.0f, 150.0f, 180.0f
     };
 
     int pass = 0, fail = 0;
-
     for (float angle : test_angles) {
         loc.Reset();
+        const float phys = 90.0f - angle;
+        const float theta = phys * static_cast<float>(M_PI) / 180.0f;
+        const float delay_sec = mic_distance * std::sin(theta) / c;
+        const float delay_samples = -delay_sec * fs;
 
-        // Convert from [0,180] coordinate to physical angle for delay calculation
-        // Physical angle = 90° - DOA (where 90° is broadside)
-        float phys_angle = 90.0f - angle;
-        float theta_rad = phys_angle * static_cast<float>(M_PI) / 180.0f;
-        float delay_sec = mic_dist * std::sin(theta_rad) / c;
-        float delay_samples = -delay_sec * fs;
-
-        // Generate broadband white noise for ch0
         std::mt19937 rng(42);
         std::normal_distribution<float> noise(0.0f, 0.5f);
         std::vector<float> ch0(total_samples + 2 * kSincHalf);
         for (auto& s : ch0) s = noise(rng);
 
-        // Create ch1 as delayed version of ch0 using windowed-sinc interpolation
-        std::vector<float> ch1(total_samples);
-        std::vector<float> ch0_trimmed(total_samples);
+        std::vector<float> ch1(total_samples), ch0_trim(total_samples);
         for (int i = 0; i < total_samples; ++i) {
-            ch0_trimmed[i] = ch0[i + kSincHalf];
-
-            float src_pos = static_cast<float>(i + kSincHalf) - delay_samples;
-            float val = 0.0f;
-            int src_int = static_cast<int>(std::floor(src_pos));
-            for (int k = src_int - kSincHalf + 1; k <= src_int + kSincHalf; ++k) {
-                if (k >= 0 && k < static_cast<int>(ch0.size())) {
-                    float x = src_pos - static_cast<float>(k);
-                    // Sinc function
-                    float sinc = (std::fabs(x) < 1e-6f)
-                        ? 1.0f
-                        : std::sin(static_cast<float>(M_PI) * x)
-                            / (static_cast<float>(M_PI) * x);
-                    // Hann window on sinc kernel
-                    float w = 0.5f * (1.0f + std::cos(
-                        static_cast<float>(M_PI) * x / kSincHalf));
-                    val += ch0[k] * sinc * w;
-                }
+            ch0_trim[i] = ch0[i + kSincHalf];
+            const float src = static_cast<float>(i + kSincHalf) - delay_samples;
+            const int center = static_cast<int>(std::floor(src));
+            float v = 0.0f;
+            for (int k = center - kSincHalf + 1; k <= center + kSincHalf; ++k) {
+                if (k < 0 || k >= static_cast<int>(ch0.size())) continue;
+                const float x = src - static_cast<float>(k);
+                const float sinc = (std::fabs(x) < 1e-6f)
+                    ? 1.0f
+                    : std::sin(static_cast<float>(M_PI) * x)
+                        / (static_cast<float>(M_PI) * x);
+                const float w = 0.5f * (1.0f + std::cos(
+                    static_cast<float>(M_PI) * x / kSincHalf));
+                v += ch0[k] * sinc * w;
             }
-            ch1[i] = val;
+            ch1[i] = v;
         }
 
-        // Feed frames
         bool ready = false;
-        for (int offset = 0; offset < total_samples; offset += cfg.frame_size) {
-            if (loc.Process(ch0_trimmed.data() + offset, ch1.data() + offset,
-                            cfg.frame_size)) {
-                ready = true;
-            }
+        for (int off = 0; off < total_samples; off += cfg.frame_size) {
+            if (loc.Process(ch0_trim.data() + off, ch1.data() + off,
+                            cfg.frame_size)) ready = true;
         }
-
         if (!ready) {
-            printf("  %6.1f° → NO RESULT\n", ReportAngle(angle, flip_angle));
-            ++fail;
-            continue;
+            std::printf("  %6.1f° → NO RESULT\n", ReportAngle2ch(angle, flip));
+            ++fail; continue;
         }
 
-        float expected = ReportAngle(angle, flip_angle);
-        float est = ReportAngle(loc.GetDOA(), flip_angle);
-        float err_abs = std::fabs(est - expected);
-        // Avoid division by zero for 0° and 180° endfire
-        float err_pct = err_abs;
-        if (expected > 1.0f && expected < 179.0f) {
-            err_pct = err_abs / std::min(expected, 180.0f - expected) * 100.0f;
-        }
+        const float expected = ReportAngle2ch(angle, flip);
+        const float est = ReportAngle2ch(loc.GetDOA(), flip);
+        const float err = std::fabs(est - expected);
+        float err_pct = err;
+        if (expected > 1.0f && expected < 179.0f)
+            err_pct = err / std::min(expected, 180.0f - expected) * 100.0f;
 
-        constexpr float kMaxErrPct = 3.0f;
-        constexpr float kMaxErrDeg = 2.5f;
-        const bool passed_threshold = (err_pct < kMaxErrPct || err_abs < kMaxErrDeg);
-        const char* status = passed_threshold ? "PASS" : "FAIL";
-        if (status[0] == 'P') {
+        const bool ok = (err_pct < 3.0f) || (err < 2.5f);
+        if (ok) {
             ++pass;
         } else {
             ++fail;
         }
-
-        printf("  %6.1f° → %7.2f° | err: %.2f° (%.1f%%) | conf: %.3f | delay: %.3f samp | %s\n",
-                expected, est, err_abs, err_pct, loc.GetConfidence(),
-                delay_samples, status);
+        std::printf("  %6.1f° → %7.2f° | err: %.2f° (%.1f%%) | conf: %.3f | delay: %.3f samp | %s\n",
+                    expected, est, err, err_pct, loc.GetConfidence(),
+                    delay_samples, ok ? "PASS" : "FAIL");
     }
 
-    printf("\n--- Results: %d/%d passed ---\n", pass, pass + fail);
+    std::printf("\n--- Results: %d/%d passed ---\n", pass, pass + fail);
     return fail > 0 ? 1 : 0;
 }
 
-// -----------------------------------------------------------------------
-// WAV file mode
-// -----------------------------------------------------------------------
-static int RunFile(const char* path, float mic_dist, bool verbose, bool flip_angle) {
-    std::vector<int16_t> samples;
-    int channels, sample_rate;
-    if (!ReadWav(path, samples, channels, sample_rate)) return 1;
-
-    if (channels != 2) {
-        fprintf(stderr, "WAV must be stereo (got %d channels)\n", channels);
+int RunFile_2ch(const char* path, float mic_distance, bool verbose, bool flip) {
+    WavData wav;
+    if (!ReadWav(path, wav)) return 1;
+    if (wav.channels != 2) {
+        std::fprintf(stderr, "WAV must be stereo (got %d channels). "
+            "For multi-channel WAV use -c 3 (or omit -c to auto-detect).\n",
+            wav.channels);
         return 1;
     }
 
-    printf("=== WAV File: %s ===\n", path);
-    printf("Sample rate: %d Hz | Samples: %zu | Duration: %.2f s\n",
-            sample_rate, samples.size() / 2,
-            static_cast<float>(samples.size() / 2) / sample_rate);
-    PrintAngleMapping(flip_angle);
+    std::printf("=== 2-ch WAV File: %s ===\n", path);
+    std::printf("Sample rate: %d Hz | Samples: %zu | Duration: %.2f s\n",
+                wav.sample_rate, wav.samples.size() / 2,
+                static_cast<float>(wav.samples.size() / 2) / wav.sample_rate);
+    if (flip) std::printf("Angle mapping: flipped\n");
 
     SpacemitAudio::SoundLocatorConfig cfg;
-    cfg.sample_rate = sample_rate;
-    cfg.mic_distance = mic_dist;
+    cfg.sample_rate = wav.sample_rate;
+    cfg.mic_distance = mic_distance;
     cfg.frame_size = 512;
     cfg.avg_frames = 4;
-    printf("Configured max TDOA: ±%.6fs (mic_distance=%.4fm)\n",
-            mic_dist / cfg.sound_speed, mic_dist);
 
     SpacemitAudio::SoundLocator loc(cfg);
     if (!loc.Initialize()) {
-        fprintf(stderr, "Initialize failed\n");
+        std::fprintf(stderr, "Initialize failed\n");
         return 1;
     }
 
-    const size_t num_frames_total = samples.size() / 2;
-    const float audio_duration =
-        static_cast<float>(num_frames_total) / sample_rate;
-    size_t offset = 0;
-    int frame_no = 0;
-
-    auto t_start = std::chrono::steady_clock::now();
-
-    while (offset < num_frames_total) {
-        size_t chunk = std::min(static_cast<size_t>(cfg.frame_size),
-                num_frames_total - offset);
-        if (loc.Process(samples.data() + offset * 2, chunk)) {
-            ++frame_no;
+    const size_t n_total = wav.samples.size() / 2;
+    const float dur = static_cast<float>(n_total) / wav.sample_rate;
+    size_t off = 0; int fno = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    while (off < n_total) {
+        size_t chunk = std::min(static_cast<size_t>(cfg.frame_size), n_total - off);
+        if (loc.Process(wav.samples.data() + off * 2, chunk)) {
+            ++fno;
             if (verbose) {
                 if (loc.IsValid()) {
                     const float max_tdoa = cfg.mic_distance / cfg.sound_speed;
-                    const float delay_ratio = std::fabs(loc.GetTDOA()) / max_tdoa;
-                    printf("[Frame %03d] DOA: %7.2f° | TDOA: %+.6fs | Ratio: %.3f | Conf: %.3f\n",
-                            frame_no, ReportAngle(loc.GetDOA(), flip_angle),
-                            loc.GetTDOA(), delay_ratio,
-                            loc.GetConfidence());
+                    const float ratio = std::fabs(loc.GetTDOA()) / max_tdoa;
+                    std::printf("[Frame %03d] DOA: %7.2f° | TDOA: %+.6fs | Ratio: %.3f | Conf: %.3f\n",
+                                fno, ReportAngle2ch(loc.GetDOA(), flip),
+                                loc.GetTDOA(), ratio, loc.GetConfidence());
                 } else {
-                    printf("[Frame %03d] DOA: ------- | Conf: %.3f (below threshold)\n",
-                            frame_no, loc.GetConfidence());
+                    std::printf("[Frame %03d] DOA: ------- | Conf: %.3f (below threshold)\n",
+                                fno, loc.GetConfidence());
                 }
             }
         }
-        offset += chunk;
+        off += chunk;
     }
-
-    auto t_end = std::chrono::steady_clock::now();
-    float process_ms = std::chrono::duration<float, std::milli>(
-        t_end - t_start).count();
-    float rtf = (process_ms / 1000.0f) / audio_duration;
-
-    if (loc.GetResultCount() > 0) {
-        printf("\nest angle = %.1f\n", ReportAngle(loc.GetAverageDOA(), flip_angle));
-    } else {
-        printf("\nest angle = N/A (no valid frames)\n");
-    }
-    printf("Process: %.1f ms | Audio: %.2f s | RTF: %.4f\n",
-            process_ms, audio_duration, rtf);
-
+    const auto t1 = std::chrono::steady_clock::now();
+    const float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
+    if (loc.GetResultCount() > 0)
+        std::printf("\nest angle = %.1f\n", ReportAngle2ch(loc.GetAverageDOA(), flip));
+    else
+        std::printf("\nest angle = N/A (no valid frames)\n");
+    std::printf("Process: %.1f ms | Audio: %.2f s | RTF: %.4f\n",
+                ms, dur, (ms / 1000.0f) / dur);
     return 0;
 }
 
-// -----------------------------------------------------------------------
-// Live capture mode (requires spacemit_audio)
-// -----------------------------------------------------------------------
 #ifdef HAS_SPACEMIT_AUDIO
-static volatile std::sig_atomic_t g_stop_requested = 0;
-
-static void HandleSignal(int) {
-    g_stop_requested = 1;
-}
-
-static int RunLive(
-    float mic_dist,
-    int sample_rate,
-    int device_index,
-    bool verbose,
-    bool flip_angle) {
-    printf("=== Live Capture ===\n");
+int RunLive_2ch(float mic_distance, int sample_rate, int device_index,
+                bool verbose, bool flip) {
+    std::printf("=== 2-ch Live Capture ===\n");
     SpacemitAudio::SoundLocatorConfig cfg;
     cfg.sample_rate = sample_rate;
-    cfg.mic_distance = mic_dist;
+    cfg.mic_distance = mic_distance;
     cfg.frame_size = 512;
     cfg.avg_frames = 4;
-    printf("Mic distance: %.4f m | Sample rate: %d Hz | Device: %d\n",
-            mic_dist, sample_rate, device_index);
-    printf("Configured max TDOA: ±%.6fs\n", mic_dist / cfg.sound_speed);
-    PrintAngleMapping(flip_angle);
-    printf("Press Ctrl+C to stop.\n");
-    printf("If no DOA is printed, speak or clap near one side of the microphone array.\n\n");
+    std::printf("Mic distance: %.4f m | Sample rate: %d Hz | Device: %d\n",
+                mic_distance, sample_rate, device_index);
 
     SpacemitAudio::SoundLocator loc(cfg);
     if (!loc.Initialize()) {
-        fprintf(stderr, "Initialize failed\n");
+        std::fprintf(stderr, "Initialize failed\n");
         return 1;
     }
 
-    int chunk_size = cfg.frame_size * 2 * 2;  // stereo, int16
-    SpacemitAudio::Init(sample_rate, 2, chunk_size, device_index, -1);
-    SpacemitAudio::AudioCapture capture(device_index);
+    const int chunk = cfg.frame_size * 2 * 2;
+    SpacemitAudio::Init(sample_rate, 2, chunk, device_index, -1);
+    SpacemitAudio::AudioCapture cap(device_index);
+    std::atomic<int> cb{0}, rdy{0}, vld{0}, conf_milli{0};
 
-    int frame_no = 0;
-    std::atomic<int> callback_count{0};
-    std::atomic<int> ready_count{0};
-    std::atomic<int> valid_count{0};
-    std::atomic<int> last_confidence_milli{0};
-
-    capture.SetCallback([&](const uint8_t* data, size_t size) {
-        ++callback_count;
-        size_t num_frames = size / (2 * sizeof(int16_t));
-        const auto* pcm = reinterpret_cast<const int16_t*>(data);
-
-        if (loc.Process(pcm, num_frames)) {
-            ++ready_count;
-            last_confidence_milli.store(
-                static_cast<int>(loc.GetConfidence() * 1000.0f));
-            ++frame_no;
+    cap.SetCallback([&](const uint8_t* d, size_t s) {
+        ++cb;
+        size_t nf = s / (2 * sizeof(int16_t));
+        const auto* pcm = reinterpret_cast<const int16_t*>(d);
+        if (loc.Process(pcm, nf)) {
+            ++rdy;
+            conf_milli.store(static_cast<int>(loc.GetConfidence() * 1000.0f));
             if (loc.IsValid()) {
-                ++valid_count;
-                const float max_tdoa = cfg.mic_distance / cfg.sound_speed;
-                const float delay_ratio = std::fabs(loc.GetTDOA()) / max_tdoa;
-                printf("\r[%04d] DOA: %7.2f° | TDOA: %+.6fs | Ratio: %.3f | Conf: %.3f    ",
-                        frame_no, ReportAngle(loc.GetDOA(), flip_angle),
-                        loc.GetTDOA(), delay_ratio,
-                        loc.GetConfidence());
-                fflush(stdout);
+                ++vld;
+                std::printf("\r[%04d] DOA: %7.2f° | Conf: %.3f    ",
+                            rdy.load(), ReportAngle2ch(loc.GetDOA(), flip),
+                            loc.GetConfidence());
+                std::fflush(stdout);
             } else if (verbose) {
-                printf("\r[%04d] DOA: ------- | Conf: %.3f (below threshold)    ",
-                        frame_no, loc.GetConfidence());
-                fflush(stdout);
+                std::printf("\r[%04d] DOA: ------- | Conf: %.3f    ",
+                            rdy.load(), loc.GetConfidence());
+                std::fflush(stdout);
             }
         }
     });
-
-    if (!capture.Start(sample_rate, 2, chunk_size)) {
-        fprintf(stderr, "Failed to start capture\n");
-        return 1;
+    if (!cap.Start(sample_rate, 2, chunk)) {
+        std::fprintf(stderr, "Failed to start capture\n"); return 1;
     }
-
+    std::printf("Press Ctrl+C to stop.\n\n");
     g_stop_requested = 0;
     std::signal(SIGINT, HandleSignal);
     std::signal(SIGTERM, HandleSignal);
-
-    auto last_status = std::chrono::steady_clock::now();
-    while (!g_stop_requested) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        auto now = std::chrono::steady_clock::now();
-        if (valid_count.load() == 0 &&
-                now - last_status >= std::chrono::seconds(1)) {
-            last_status = now;
-            printf("\rWaiting for valid DOA... callbacks: %d, frames: %d, conf: %.3f    ",
-                    callback_count.load(),
-                    ready_count.load(),
-                    last_confidence_milli.load() / 1000.0f);
-            fflush(stdout);
-        }
-    }
-
-    capture.Stop();
-    printf("\nStopped. callbacks: %d, frames: %d, valid: %d\n",
-            callback_count.load(), ready_count.load(), valid_count.load());
+    while (!g_stop_requested) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    cap.Stop();
+    std::printf("\nStopped. callbacks: %d, frames: %d, valid: %d\n",
+                cb.load(), rdy.load(), vld.load());
     return 0;
 }
-#endif  // HAS_SPACEMIT_AUDIO
+#endif
 
-// -----------------------------------------------------------------------
-// Usage
-// -----------------------------------------------------------------------
-static void PrintUsage(const char* prog) {
-    printf("Usage:\n");
-    printf("  %s -t [-d mic_dist] [-r rate] [--flip]\n", prog);
-    printf("  %s -f <stereo.wav> [-d mic_dist] [-v] [--flip]\n", prog);
-#ifdef HAS_SPACEMIT_AUDIO
-    printf("  %s -l [-d mic_dist] [-r rate] [-i device] [--flip]\n", prog);
-#endif
-    printf("\nMode:\n");
-    printf("  -t, --test      Synthetic accuracy test\n");
-    printf("  -f, --file      Process a stereo WAV file\n");
-#ifdef HAS_SPACEMIT_AUDIO
-    printf("  -l, --live      Live capture from microphone\n");
-#endif
-    printf("\nOptions:\n");
-    printf("  -d  Microphone distance in meters (default: 0.058)\n");
-    printf("  -r  Sample rate in Hz (default: 16000)\n");
-    printf("  -i  Audio capture device index (default: -1 = auto)\n");
-    printf("  -v, --verbose   Print per-frame details (file/live mode)\n");
-    printf("  --flip          Report mirrored angle: 0->180, 50->130, 180->0\n");
+// ===========================================================================
+// 3+ channel mode (MultiSoundLocator)
+// ===========================================================================
+
+bool IsPairEndfireAngle(float a) {
+    constexpr float kAngles[] = {60.0f, 120.0f, 240.0f, 300.0f};
+    for (float c : kAngles) if (CircularError(a, c) <= 0.5f) return true;
+    return false;
 }
 
-// -----------------------------------------------------------------------
-// Main
-// -----------------------------------------------------------------------
+float ToleranceFor(float a, bool noise) {
+    return (noise || IsPairEndfireAngle(a)) ? 5.0f : 2.0f;
+}
+
+float Sinc(float x) {
+    if (std::fabs(x) < 1e-6f) return 1.0f;
+    const float p = static_cast<float>(M_PI) * x;
+    return std::sin(p) / p;
+}
+
+float LanczosKernel(float x) {
+    constexpr float a = static_cast<float>(kLanczosHalf);
+    if (std::fabs(x) >= a) return 0.0f;
+    return Sinc(x) * Sinc(x / a);
+}
+
+std::vector<float> MakeChirp(int n, int sr) {
+    std::vector<float> s(n);
+    const float dur = static_cast<float>(n) / sr;
+    const float f0 = 200.0f, f1 = 4000.0f, sweep = (f1 - f0) / dur;
+    for (int i = 0; i < n; ++i) {
+        const float t = static_cast<float>(i) / sr;
+        const float phase = 2.0f * static_cast<float>(M_PI)
+            * (f0 * t + 0.5f * sweep * t * t);
+        s[i] = 0.7f * std::sin(phase);
+    }
+    return s;
+}
+
+std::vector<float> FractionalDelay(const std::vector<float>& base,
+    int n_frames, float delay_samples) {
+    std::vector<float> out(n_frames, 0.0f);
+    const int pad = (static_cast<int>(base.size()) - n_frames) / 2;
+    for (int n = 0; n < n_frames; ++n) {
+        const float src = static_cast<float>(n + pad) - delay_samples;
+        const int center = static_cast<int>(std::floor(src));
+        float val = 0.0f, wsum = 0.0f;
+        for (int k = center - kLanczosHalf; k <= center + kLanczosHalf; ++k) {
+            if (k < 0 || k >= static_cast<int>(base.size())) continue;
+            const float x = src - static_cast<float>(k);
+            const float w = LanczosKernel(x);
+            val += base[k] * w; wsum += w;
+        }
+        if (std::fabs(wsum) > 1e-6f) val /= wsum;
+        out[n] = val;
+    }
+    return out;
+}
+
+std::vector<float> GenerateSyntheticInterleaved(
+    const SpacemitAudio::MultiSoundLocatorConfig& cfg,
+    float angle_deg, float noise_snr_db) {
+    const int n_frames = cfg.frame_size * cfg.avg_frames;
+    const int pad = 64;
+    const int sr = cfg.sample_rate;
+    const float a_rad = angle_deg * static_cast<float>(M_PI) / 180.0f;
+    const float dx = std::cos(a_rad), dy = std::sin(a_rad);
+    auto base = MakeChirp(n_frames + 2 * pad, sr);
+    std::vector<std::vector<float>> chs;
+    chs.reserve(cfg.microphones.size());
+    for (const auto& m : cfg.microphones) {
+        const float adv = (m.x * dx + m.y * dy) / cfg.sound_speed;
+        chs.push_back(FractionalDelay(base, n_frames, -adv * sr));
+    }
+    const bool noise = std::isfinite(noise_snr_db);
+    if (noise) {
+        std::mt19937 rng(42);
+        for (auto& ch : chs) {
+            float p = 0.0f; for (float s : ch) p += s * s;
+            p /= static_cast<float>(ch.size());
+            const float rms = std::sqrt(std::max(p, 1e-12f));
+            const float ns = rms / std::pow(10.0f, noise_snr_db / 20.0f);
+            std::normal_distribution<float> nz(0.0f, ns);
+            for (auto& s : ch) s += nz(rng);
+        }
+    }
+    std::vector<float> il(n_frames * cfg.microphones.size());
+    for (int f = 0; f < n_frames; ++f)
+        for (size_t c = 0; c < cfg.microphones.size(); ++c)
+            il[f * cfg.microphones.size() + c] = chs[c][f];
+    return il;
+}
+
+bool ParseSweep(const std::string& spec, std::vector<float>& angles) {
+    const size_t a = spec.find(':');
+    const size_t b = (a == std::string::npos) ? a : spec.find(':', a + 1);
+    if (a == std::string::npos || b == std::string::npos) return false;
+    const float st = std::stof(spec.substr(0, a));
+    const float ed = std::stof(spec.substr(a + 1, b - a - 1));
+    const float sp = std::stof(spec.substr(b + 1));
+    if (std::fabs(sp) < 1e-6f) return false;
+    angles.clear();
+    if (sp > 0.0f) {
+        for (float v = st; v <= ed + 1e-4f; v += sp) angles.push_back(NormalizeAngle360(v));
+    } else {
+        for (float v = st; v >= ed - 1e-4f; v += sp) angles.push_back(NormalizeAngle360(v));
+    }
+    return !angles.empty();
+}
+
+bool ParsePositions(const std::string& spec,
+                    std::vector<SpacemitAudio::MicrophonePosition>& positions) {
+    positions.clear();
+    size_t start = 0;
+    while (start < spec.size()) {
+        const size_t semi = spec.find(';', start);
+        const std::string mic = spec.substr(start, semi - start);
+        if (mic.empty()) {
+            if (semi == std::string::npos) break;
+            start = semi + 1; continue;
+        }
+        float vals[3] = {0.0f, 0.0f, 0.0f}; int n = 0; size_t cs = 0;
+        while (cs < mic.size() && n < 3) {
+            const size_t comma = mic.find(',', cs);
+            const std::string coord = mic.substr(cs, comma - cs);
+            if (!coord.empty()) vals[n++] = static_cast<float>(std::atof(coord.c_str()));
+            if (comma == std::string::npos) break;
+            cs = comma + 1;
+        }
+        if (n < 2) return false;
+        positions.push_back({vals[0], vals[1], vals[2]});
+        if (semi == std::string::npos) break;
+        start = semi + 1;
+    }
+    return positions.size() >= 2;
+}
+
+struct MultiOverrides {
+    bool have_closure = false;     float closure_threshold_samples = 0;
+    bool have_quality = false;     float quality_threshold = 0;
+    bool have_margin = false;      float margin_threshold = 0;
+    bool have_max_freq = false;    float max_frequency_hz = 0;
+};
+
+SpacemitAudio::MultiSoundLocatorConfig MakeMultiConfig(
+    float mic_distance, int sample_rate, float az_offset, float max_avg_seconds,
+    const std::vector<SpacemitAudio::MicrophonePosition>& positions_override,
+    const MultiOverrides& ov) {
+    SpacemitAudio::MultiSoundLocatorConfig cfg;
+    if (positions_override.empty())
+        cfg = SpacemitAudio::MultiSoundLocator::CreateEquilateralTriangleConfig(mic_distance);
+    else
+        cfg.microphones = positions_override;
+    cfg.sample_rate = sample_rate;
+    cfg.frame_size = 512;
+    cfg.avg_frames = 4;
+    cfg.confidence_threshold = 0.1f;
+    cfg.azimuth_offset_deg = az_offset;
+    cfg.max_avg_seconds = max_avg_seconds;
+    if (ov.have_closure)  cfg.closure_threshold_samples = ov.closure_threshold_samples;
+    if (ov.have_quality)  cfg.quality_threshold = ov.quality_threshold;
+    if (ov.have_margin)   cfg.margin_threshold = ov.margin_threshold;
+    if (ov.have_max_freq) cfg.max_frequency_hz = ov.max_frequency_hz;
+    return cfg;
+}
+
+int RunTest_3ch(float mic_distance, int sample_rate,
+                const std::vector<float>& angles, float az_offset,
+                float noise_snr_db, float max_avg_seconds,
+                const std::vector<SpacemitAudio::MicrophonePosition>& positions_override,
+                const MultiOverrides& ov) {
+    std::printf("=== 3+ch Synthetic Accuracy Test ===\n");
+    std::printf("Geometry: equilateral | side: %.4f m | sample rate: %d Hz\n",
+                mic_distance, sample_rate);
+    if (std::isfinite(noise_snr_db)) std::printf("Noise SNR: %.1f dB\n", noise_snr_db);
+    std::printf("azimuth_offset_deg: %.2f\n\n", az_offset);
+    std::printf(" expected |      est |    err |   conf |  qual | margin | clos.us | pairs | status\n");
+
+    int pass = 0, fail = 0;
+    const bool noise = std::isfinite(noise_snr_db);
+
+    for (float angle : angles) {
+        const float expected = NormalizeAngle360(angle + az_offset);
+        auto cfg = MakeMultiConfig(mic_distance, sample_rate, az_offset,
+            max_avg_seconds, positions_override, ov);
+        SpacemitAudio::MultiSoundLocator loc(cfg);
+        if (!loc.Initialize()) {
+        std::fprintf(stderr, "Initialize failed\n");
+        return 1;
+    }
+
+        const auto il = GenerateSyntheticInterleaved(cfg, angle, noise_snr_db);
+        const int n_ch = static_cast<int>(cfg.microphones.size());
+        const size_t n_frames = il.size() / n_ch;
+        const bool ready = loc.Process(il.data(), n_frames, n_ch);
+        const auto r = loc.GetResult();
+        const float err = CircularError(r.azimuth_deg, expected);
+        const float tol = ToleranceFor(angle, noise);
+        const bool ok = ready && r.valid && err <= tol;
+        if (ok) {
+            ++pass;
+        } else {
+            ++fail;
+        }
+        std::printf(" %8.2f | %8.2f | %6.2f | %6.3f | %5.3f | %6.3f | %7.2f | %5d | %s\n",
+                    expected, r.azimuth_deg, err, r.confidence, r.quality,
+                    r.score_margin, r.closure_residual_sec * 1e6f,
+                    r.valid_pairs, ok ? "PASS" : "FAIL");
+    }
+    std::printf("\n--- Results: %d/%d passed ---\n", pass, pass + fail);
+    return fail == 0 ? 0 : 1;
+}
+
+int RunFile_3ch(const char* path, float mic_distance, bool verbose,
+                float az_offset, float max_avg_seconds,
+                const std::vector<SpacemitAudio::MicrophonePosition>& positions_override,
+                const MultiOverrides& ov) {
+    WavData wav;
+    if (!ReadWav(path, wav)) return 1;
+    if (wav.channels < 3) {
+        std::fprintf(stderr, "WAV must have >= 3 channels for -c 3+ (got %d). "
+            "For stereo use -c 2.\n", wav.channels);
+        return 1;
+    }
+
+    auto cfg = MakeMultiConfig(mic_distance, wav.sample_rate, az_offset,
+        max_avg_seconds, positions_override, ov);
+    if (static_cast<int>(cfg.microphones.size()) != wav.channels) {
+        std::fprintf(stderr,
+            "WAV has %d channels but config has %d mic positions; "
+            "pass --positions or use a matching equilateral side.\n",
+            wav.channels, static_cast<int>(cfg.microphones.size()));
+        return 1;
+    }
+
+    SpacemitAudio::MultiSoundLocator loc(cfg);
+    if (!loc.Initialize()) {
+        std::fprintf(stderr, "Initialize failed\n");
+        return 1;
+    }
+
+    const size_t n_total = wav.samples.size() / wav.channels;
+    const float dur = static_cast<float>(n_total) / wav.sample_rate;
+    std::printf("=== %dch WAV File: %s ===\n", wav.channels, path);
+    std::printf("Sample rate: %d Hz | Frames: %zu | Duration: %.2f s\n",
+                wav.sample_rate, n_total, dur);
+
+    size_t off = 0; int fno = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    while (off < n_total) {
+        const size_t chunk = std::min(static_cast<size_t>(cfg.frame_size),
+            n_total - off);
+        if (loc.Process(wav.samples.data() + off * wav.channels, chunk,
+                        wav.channels)) {
+            ++fno;
+            if (verbose) {
+                const auto r = loc.GetResult();
+                if (r.valid) {
+                    std::printf(
+                        "[Frame %03d] az: %7.2f° | conf: %.3f | qual: %.3f | "
+                        "clos: %.2f us | pairs: %d\n",
+                        fno, r.azimuth_deg, r.confidence, r.quality,
+                        r.closure_residual_sec * 1e6f, r.valid_pairs);
+                } else {
+                    std::printf("[Frame %03d] az: ------- | conf: %.3f\n",
+                        fno, r.confidence);
+                }
+            }
+        }
+        off += chunk;
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    const float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
+    if (loc.GetResultCount() > 0)
+        std::printf("\nest azimuth = %.1f (R = %.3f)\n",
+                    loc.GetAverageAzimuth(), loc.GetAverageResultantLength());
+    else
+        std::printf("\nest azimuth = N/A (no valid frames)\n");
+    std::printf("Process: %.1f ms | Audio: %.2f s | RTF: %.4f\n",
+                ms, dur, (ms / 1000.0f) / dur);
+    return 0;
+}
+
+#ifdef HAS_SPACEMIT_AUDIO
+int RunLive_3ch(float mic_distance, int sample_rate, int device_index,
+                bool verbose, float az_offset, float max_avg_seconds,
+                const std::vector<SpacemitAudio::MicrophonePosition>& positions_override,
+                const MultiOverrides& ov) {
+    auto cfg = MakeMultiConfig(mic_distance, sample_rate, az_offset,
+        max_avg_seconds, positions_override, ov);
+    const int n_ch = static_cast<int>(cfg.microphones.size());
+    SpacemitAudio::MultiSoundLocator loc(cfg);
+    if (!loc.Initialize()) {
+        std::fprintf(stderr, "Initialize failed\n");
+        return 1;
+    }
+
+    const int chunk = cfg.frame_size * n_ch * sizeof(int16_t);
+    SpacemitAudio::Init(sample_rate, n_ch, chunk, device_index, -1);
+    SpacemitAudio::AudioCapture cap(device_index);
+    std::atomic<int> cb{0}, rdy{0}, vld{0}, conf_milli{0};
+
+    cap.SetCallback([&](const uint8_t* d, size_t s) {
+        ++cb;
+        const size_t nf = s / (n_ch * sizeof(int16_t));
+        if (nf == 0) return;
+        const auto* pcm = reinterpret_cast<const int16_t*>(d);
+        if (loc.Process(pcm, nf, n_ch)) {
+            ++rdy;
+            const auto r = loc.GetResult();
+            conf_milli.store(static_cast<int>(r.confidence * 1000.0f));
+            if (r.valid) {
+                ++vld;
+                std::printf("\r[%04d] az: %7.2f° | conf: %.3f | qual: %.3f | clos: %.2f us    ",
+                            rdy.load(), r.azimuth_deg, r.confidence, r.quality,
+                            r.closure_residual_sec * 1e6f);
+                std::fflush(stdout);
+            } else if (verbose) {
+                std::printf("\r[%04d] az: ------- | conf: %.3f    ",
+                            rdy.load(), r.confidence);
+                std::fflush(stdout);
+            }
+        }
+    });
+    if (!cap.Start(sample_rate, n_ch, chunk)) {
+        std::fprintf(stderr, "Failed to start capture\n"); return 1;
+    }
+    std::printf("=== Live %dch Capture ===\nside: %.4f m | rate: %d Hz | device: %d\nPress Ctrl+C to stop.\n\n",
+                n_ch, mic_distance, sample_rate, device_index);
+    g_stop_requested = 0;
+    std::signal(SIGINT, HandleSignal);
+    std::signal(SIGTERM, HandleSignal);
+    while (!g_stop_requested) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    cap.Stop();
+    std::printf("\nStopped. callbacks: %d, frames: %d, valid: %d\n",
+                cb.load(), rdy.load(), vld.load());
+    return 0;
+}
+#endif
+
+// ===========================================================================
+// Usage + main
+// ===========================================================================
+
+void PrintUsage(const char* prog) {
+    std::printf("Usage (channels selected by -c N; N=2 → SoundLocator, N>=3 → MultiSoundLocator):\n");
+    std::printf("  %s -c 2 -t [-d M] [-r RATE] [--flip]\n", prog);
+    std::printf("  %s -c 2 -f stereo.wav [-d M] [-v] [--flip]\n", prog);
+#ifdef HAS_SPACEMIT_AUDIO
+    std::printf("  %s -c 2 -l [-d M] [-r RATE] [-i DEV] [--flip]\n", prog);
+#endif
+    std::printf("\n");
+    std::printf("  %s -c 3 -t [-d M] [--angle DEG | --sweep A:B:S] [--noise-snr DB]\n", prog);
+    std::printf("                   [--azimuth-offset DEG] [--positions SPEC]\n");
+    std::printf("                   [--avg-seconds S] [--quality-threshold F]\n");
+    std::printf("                   [--margin-threshold F] [--closure-threshold-samples F]\n");
+    std::printf("                   [--max-frequency-hz F]\n");
+    std::printf("  %s -c 3 -f Nch.wav [-d M] [-v] [--positions SPEC]\n", prog);
+    std::printf("                   [--azimuth-offset DEG] [--avg-seconds S]\n");
+#ifdef HAS_SPACEMIT_AUDIO
+    std::printf("  %s -c 3 -l [-d M] [-r RATE] [-i DEV] [-v]\n", prog);
+    std::printf("                   [--positions SPEC] [--azimuth-offset DEG]\n");
+    std::printf("                   [--avg-seconds S]\n");
+#endif
+    std::printf("\n");
+    std::printf("  %s -h | --help\n\n", prog);
+    std::printf("Common flags:\n");
+    std::printf("  -c N                       Channel count (2 → 2-ch, >=3 → multi). In -f mode\n");
+    std::printf("                              you can omit -c and it auto-detects from the WAV.\n");
+    std::printf("  -d, --mic-distance M       Mic spacing in meters. Default %.4f (2-ch) /\n",
+                kDefault2chMicDistance);
+    std::printf("                              %.4f (3-ch). A WARNING is printed if you don't\n",
+                kDefault3chMicDistance);
+    std::printf("                              set it explicitly — production code MUST measure\n");
+    std::printf("                              the physical spacing.\n");
+    std::printf("  -r RATE                    Sample rate Hz (default 16000)\n");
+    std::printf("  -i DEV                     Capture device index (default -1 = auto)\n");
+    std::printf("  -v, --verbose              Per-frame output (file / live mode)\n");
+    std::printf("  -t / -f WAV / -l           Mode selector\n");
+    std::printf("\n2-ch (-c 2) specific:\n");
+    std::printf("  --flip                     Report 180 − DOA (legacy alias). For -c 3 use\n");
+    std::printf("                              --azimuth-offset instead.\n");
+    std::printf("\n3+ ch (-c 3+) specific:\n");
+    std::printf("  --angle DEG                Single synthetic angle (test mode)\n");
+    std::printf("  --sweep A:B:S              Synthetic sweep, inclusive (test mode)\n");
+    std::printf("  --noise-snr DB             Add Gaussian noise at the requested SNR\n");
+    std::printf("  --azimuth-offset DEG       Array → robot frame offset (degrees)\n");
+    std::printf("  --positions x0,y0;x1,y1... Override mic positions (N>=2; skips equilateral)\n");
+    std::printf("  --avg-seconds S            Sliding-window length for GetAverageAzimuth.\n");
+    std::printf("                              Default 0 = unbounded since Reset — use a\n");
+    std::printf("                              positive value for live capture / long sessions\n");
+    std::printf("                              to bound memory.\n");
+    std::printf("  --quality-threshold F      Override config.quality_threshold (default 0.0)\n");
+    std::printf("  --margin-threshold F       Override config.margin_threshold (default 0.6)\n");
+    std::printf("  --closure-threshold-samples F\n");
+    std::printf("                              Override config.closure_threshold_samples (N=3\n");
+    std::printf("                              only; default 2.0; set ≤0 to disable gate)\n");
+    std::printf("  --max-frequency-hz F       Override config.max_frequency_hz (default 0 =\n");
+    std::printf("                              auto alias-safe c / 2·d_max)\n");
+}
+
+struct Args {
+    int channels = 0;
+    enum Mode { NONE, TEST, FILE, LIVE } mode = NONE;
+    const char* wav_path = nullptr;
+    float mic_distance = 0.0f;
+    bool mic_distance_set = false;
+    int sample_rate = 16000;
+    int device_index = -1;
+    bool verbose = false;
+    bool flip = false;
+    bool have_angle = false;
+    float angle = 90.0f;
+    std::string sweep_spec;
+    float az_offset = 0.0f;
+    float noise_snr_db = std::numeric_limits<float>::infinity();
+    float max_avg_seconds = 0.0f;
+    std::vector<SpacemitAudio::MicrophonePosition> positions_override;
+    MultiOverrides multi_overrides;
+    bool help = false;
+};
+
+bool ParseArgs(int argc, char* argv[], Args& a) {
+    for (int i = 1; i < argc; ++i) {
+        const char* s = argv[i];
+        if (std::strcmp(s, "-h") == 0 || std::strcmp(s, "--help") == 0) {
+            a.help = true;
+        } else if (std::strcmp(s, "-c") == 0 && i + 1 < argc) {
+            a.channels = std::atoi(argv[++i]);
+        } else if (std::strcmp(s, "-t") == 0 || std::strcmp(s, "--test") == 0) {
+            a.mode = Args::TEST;
+        } else if (std::strcmp(s, "-f") == 0 || std::strcmp(s, "--file") == 0) {
+            a.mode = Args::FILE;
+            if (i + 1 < argc && argv[i + 1][0] != '-') a.wav_path = argv[++i];
+        } else if (std::strcmp(s, "-l") == 0 || std::strcmp(s, "--live") == 0) {
+            a.mode = Args::LIVE;
+        } else if ((std::strcmp(s, "-d") == 0 || std::strcmp(s, "--mic-distance") == 0)
+            && i + 1 < argc) {
+            a.mic_distance = static_cast<float>(std::atof(argv[++i]));
+            a.mic_distance_set = true;
+        } else if (std::strcmp(s, "-r") == 0 && i + 1 < argc) {
+            a.sample_rate = std::atoi(argv[++i]);
+        } else if (std::strcmp(s, "-i") == 0 && i + 1 < argc) {
+            a.device_index = std::atoi(argv[++i]);
+        } else if (std::strcmp(s, "-v") == 0 || std::strcmp(s, "--verbose") == 0) {
+            a.verbose = true;
+        } else if (std::strcmp(s, "--flip") == 0) {
+            a.flip = true;
+        } else if (std::strcmp(s, "--angle") == 0 && i + 1 < argc) {
+            a.angle = static_cast<float>(std::atof(argv[++i])); a.have_angle = true;
+        } else if (std::strcmp(s, "--sweep") == 0 && i + 1 < argc) {
+            a.sweep_spec = argv[++i];
+        } else if (std::strcmp(s, "--noise-snr") == 0 && i + 1 < argc) {
+            a.noise_snr_db = static_cast<float>(std::atof(argv[++i]));
+        } else if (std::strcmp(s, "--azimuth-offset") == 0 && i + 1 < argc) {
+            a.az_offset = static_cast<float>(std::atof(argv[++i]));
+        } else if (std::strcmp(s, "--avg-seconds") == 0 && i + 1 < argc) {
+            a.max_avg_seconds = static_cast<float>(std::atof(argv[++i]));
+        } else if (std::strcmp(s, "--positions") == 0 && i + 1 < argc) {
+            if (!ParsePositions(argv[++i], a.positions_override)) {
+                std::fprintf(stderr, "Error: --positions must be N>=2 mics 'x,y[,z];...'\n");
+                return false;
+            }
+        } else if (std::strcmp(s, "--quality-threshold") == 0 && i + 1 < argc) {
+            a.multi_overrides.have_quality = true;
+            a.multi_overrides.quality_threshold = static_cast<float>(std::atof(argv[++i]));
+        } else if (std::strcmp(s, "--margin-threshold") == 0 && i + 1 < argc) {
+            a.multi_overrides.have_margin = true;
+            a.multi_overrides.margin_threshold = static_cast<float>(std::atof(argv[++i]));
+        } else if (std::strcmp(s, "--closure-threshold-samples") == 0 && i + 1 < argc) {
+            a.multi_overrides.have_closure = true;
+            a.multi_overrides.closure_threshold_samples =
+                static_cast<float>(std::atof(argv[++i]));
+        } else if (std::strcmp(s, "--max-frequency-hz") == 0 && i + 1 < argc) {
+            a.multi_overrides.have_max_freq = true;
+            a.multi_overrides.max_frequency_hz = static_cast<float>(std::atof(argv[++i]));
+        } else if (s[0] == '-') {
+            std::fprintf(stderr, "Unknown flag: %s\n", s);
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         PrintUsage(argv[0]);
         return 1;
     }
 
-    float mic_dist = 0.058f;
-    int sample_rate = 16000;
-    int device_index = -1;
-    bool verbose = false;
-    bool flip_angle = false;
-    const char* mode = nullptr;
-    const char* wav_path = nullptr;
-
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--test") == 0) {
-            mode = "test";
-        } else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) {
-            mode = "file";
-            if (i + 1 < argc && argv[i + 1][0] != '-') {
-                wav_path = argv[++i];
-            }
-        } else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--live") == 0) {
-            mode = "live";
-        } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
-            verbose = true;
-        } else if (strcmp(argv[i], "--flip") == 0) {
-            flip_angle = true;
-        } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
-            mic_dist = static_cast<float>(atof(argv[++i]));
-        } else if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) {
-            sample_rate = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
-            device_index = atoi(argv[++i]);
-        }
+    Args a;
+    if (!ParseArgs(argc, argv, a)) {
+        PrintUsage(argv[0]);
+        return 1;
     }
-
-    if (!mode) {
+    if (a.help) {
+        PrintUsage(argv[0]);
+        return 0;
+    }
+    if (a.mode == Args::NONE) {
+        std::fprintf(stderr, "Error: choose a mode: -t / -f WAV / -l\n\n");
         PrintUsage(argv[0]);
         return 1;
     }
 
-    if (strcmp(mode, "test") == 0) {
-        return RunTest(mic_dist, sample_rate, flip_angle);
+    // Auto-detect channels from WAV in file mode if -c was omitted.
+    if (a.channels == 0 && a.mode == Args::FILE && a.wav_path) {
+        WavData probe;
+        if (!ReadWav(a.wav_path, probe)) return 1;
+        a.channels = probe.channels;
+        std::printf("[ssl_demo] auto-detected -c %d from WAV header\n", a.channels);
+    }
+    if (a.channels == 0) a.channels = 2;  // default for synthetic / live without -c
+
+    if (a.channels < 2) {
+        std::fprintf(stderr, "Error: -c must be >= 2 (got %d)\n", a.channels);
+        return 1;
+    }
+    if (a.channels >= 3 && a.flip) {
+        std::fprintf(stderr,
+            "Error: --flip is 2-ch only. For 3+ ch use --azimuth-offset 180.\n");
+        return 1;
     }
 
-    if (strcmp(mode, "file") == 0) {
-        if (!wav_path) {
-            fprintf(stderr, "Error: --file requires a WAV path\n\n");
-            PrintUsage(argv[0]);
-            return 1;
-        }
-        return RunFile(wav_path, mic_dist, verbose, flip_angle);
+    // Apply per-mode default mic_distance + warn if not user-set.
+    if (a.channels == 2) {
+        const float used = a.mic_distance_set ? a.mic_distance : kDefault2chMicDistance;
+        WarnIfDefaultMicDistance(a.mic_distance_set, used, "2-ch (stereo) demo");
+        a.mic_distance = used;
+    } else {
+        const float used = a.mic_distance_set ? a.mic_distance : kDefault3chMicDistance;
+        WarnIfDefaultMicDistance(a.mic_distance_set, used, "3-ch equilateral demo");
+        a.mic_distance = used;
     }
 
+    // Dispatch.
+    if (a.channels == 2) {
+        switch (a.mode) {
+            case Args::TEST:
+                return RunTest_2ch(a.mic_distance, a.sample_rate, a.flip);
+            case Args::FILE:
+                if (!a.wav_path) {
+                    std::fprintf(stderr, "Error: -f requires a WAV path\n");
+                    return 1;
+                }
+                return RunFile_2ch(a.wav_path, a.mic_distance, a.verbose, a.flip);
+            case Args::LIVE:
 #ifdef HAS_SPACEMIT_AUDIO
-    if (strcmp(mode, "live") == 0) {
-        return RunLive(mic_dist, sample_rate, device_index, verbose, flip_angle);
-    }
+                return RunLive_2ch(a.mic_distance, a.sample_rate,
+                    a.device_index, a.verbose, a.flip);
+#else
+                std::fprintf(stderr,
+                    "Live mode disabled: spacemit_audio not found at build time\n");
+                return 1;
 #endif
+            default: break;
+        }
+    } else {
+        std::vector<float> angles;
+        if (a.mode == Args::TEST) {
+            if (!a.sweep_spec.empty()) {
+                try {
+                    if (!ParseSweep(a.sweep_spec, angles)) {
+                        std::fprintf(stderr, "Invalid --sweep: %s\n",
+                            a.sweep_spec.c_str());
+                        return 1;
+                    }
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "Invalid --sweep: %s (%s)\n",
+                        a.sweep_spec.c_str(), e.what());
+                    return 1;
+                }
+            } else if (a.have_angle) {
+                angles.push_back(NormalizeAngle360(a.angle));
+            } else {
+                ParseSweep("0:330:30", angles);
+            }
+        }
+        switch (a.mode) {
+            case Args::TEST:
+                return RunTest_3ch(a.mic_distance, a.sample_rate, angles,
+                    a.az_offset, a.noise_snr_db, a.max_avg_seconds,
+                    a.positions_override, a.multi_overrides);
+            case Args::FILE:
+                if (!a.wav_path) {
+                    std::fprintf(stderr, "Error: -f requires a WAV path\n");
+                    return 1;
+                }
+                return RunFile_3ch(a.wav_path, a.mic_distance, a.verbose,
+                    a.az_offset, a.max_avg_seconds,
+                    a.positions_override, a.multi_overrides);
+            case Args::LIVE:
+#ifdef HAS_SPACEMIT_AUDIO
+                return RunLive_3ch(a.mic_distance, a.sample_rate, a.device_index,
+                    a.verbose, a.az_offset, a.max_avg_seconds,
+                    a.positions_override, a.multi_overrides);
+#else
+                std::fprintf(stderr,
+                    "Live mode disabled: spacemit_audio not found at build time\n");
+                return 1;
+#endif
+            default: break;
+        }
+    }
 
     PrintUsage(argv[0]);
     return 1;

@@ -78,8 +78,8 @@ bool GccPhatPair::Initialize(const GccPhatPairConfig& config) {
     const unsigned fftw_flags = config_.use_fftw_measure
                                     ? FFTW_MEASURE : FFTW_ESTIMATE;
     ifft_plan_ = fftwf_plan_dft_c2r_1d(config_.upsampled_size,
-                                       gcc_spectrum_up_, gcc_result_up_,
-                                       fftw_flags);
+        gcc_spectrum_up_, gcc_result_up_,
+        fftw_flags);
     if (!ifft_plan_) {
         Destroy();
         return false;
@@ -147,7 +147,7 @@ void GccPhatPair::Reset() {
 }
 
 bool GccPhatPair::Accumulate(const fftwf_complex* spectrum_i,
-                             const fftwf_complex* spectrum_j) {
+    const fftwf_complex* spectrum_j) {
     if (!phat_accumulator_ || !spectrum_i || !spectrum_j) {
         return false;
     }
