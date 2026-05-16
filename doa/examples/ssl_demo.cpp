@@ -37,6 +37,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <random>
 #include <string>
 #include <thread>
@@ -688,52 +689,137 @@ int RunFile_3ch(const char* path, float mic_distance, bool verbose,
 int RunLive_3ch(float mic_distance, int sample_rate, int device_index,
                 bool verbose, float az_offset, float max_avg_seconds,
                 const std::vector<SpacemitAudio::MicrophonePosition>& positions_override,
-                const MultiOverrides& ov) {
+                const MultiOverrides& ov,
+                int capture_channels, const std::vector<int>& pick) {
     auto cfg = MakeMultiConfig(mic_distance, sample_rate, az_offset,
         max_avg_seconds, positions_override, ov);
     const int n_ch = static_cast<int>(cfg.microphones.size());
+    const int cap_ch = capture_channels > 0 ? capture_channels : n_ch;
+    if (cap_ch < n_ch) {
+        std::fprintf(stderr,
+            "Error: --capture-channels %d < %d DOA mics\n", cap_ch, n_ch);
+        return 1;
+    }
+
+    // sel_idx is 0-based into the captured frame; sel_idx[m] feeds DOA mic m.
+    // Empty --pick = identity, only valid when device opens exactly n_ch chs.
+    std::vector<int> sel_idx;
+    if (pick.empty()) {
+        if (cap_ch != n_ch) {
+            std::fprintf(stderr,
+                "Error: --capture-channels %d != %d DOA mics requires --pick "
+                "(e.g. --pick 2,3,4 to drop an AEC ref on ch1)\n", cap_ch, n_ch);
+            return 1;
+        }
+        for (int m = 0; m < n_ch; ++m) sel_idx.push_back(m);
+    } else {
+        if (static_cast<int>(pick.size()) != n_ch) {
+            std::fprintf(stderr,
+                "Error: --pick has %zu entries, need exactly %d (one per DOA mic)\n",
+                pick.size(), n_ch);
+            return 1;
+        }
+        for (int v : pick) {
+            if (v < 1 || v > cap_ch) {
+                std::fprintf(stderr,
+                    "Error: --pick value %d out of range [1, %d]\n", v, cap_ch);
+                return 1;
+            }
+            sel_idx.push_back(v - 1);
+        }
+    }
+    const bool identity = (cap_ch == n_ch) && pick.empty();
+
     SpacemitAudio::MultiSoundLocator loc(cfg);
     if (!loc.Initialize()) {
         std::fprintf(stderr, "Initialize failed\n");
         return 1;
     }
 
-    const int chunk = cfg.frame_size * n_ch * sizeof(int16_t);
-    SpacemitAudio::Init(sample_rate, n_ch, chunk, device_index, -1);
+    const int chunk = cfg.frame_size * cap_ch * sizeof(int16_t);
+    SpacemitAudio::Init(sample_rate, cap_ch, chunk, device_index, -1);
     SpacemitAudio::AudioCapture cap(device_index);
     std::atomic<int> cb{0}, rdy{0}, vld{0}, conf_milli{0};
+    std::vector<int16_t> sel;  // persistent deinterleave buffer (non-identity)
+
+    // Real-time rule: the audio callback must not block on console I/O. A slow
+    // tty (ssh pty) write inside it stalls the ALSA read, overruns the capture
+    // buffer, and this USB gadget cannot recover from the xrun. The callback
+    // only snapshots the latest result under a tiny lock; the main thread
+    // prints it at ~10 Hz.
+    std::mutex res_mu;
+    SpacemitAudio::MultiSoundLocatorResult last_r{};
+    int last_rdy = 0;
+    bool have_r = false;
 
     cap.SetCallback([&](const uint8_t* d, size_t s) {
         ++cb;
-        const size_t nf = s / (n_ch * sizeof(int16_t));
+        const size_t nf = s / (cap_ch * sizeof(int16_t));
         if (nf == 0) return;
         const auto* pcm = reinterpret_cast<const int16_t*>(d);
-        if (loc.Process(pcm, nf, n_ch)) {
+        const int16_t* feed = pcm;
+        if (!identity) {
+            sel.resize(nf * static_cast<size_t>(n_ch));
+            for (size_t f = 0; f < nf; ++f) {
+                for (int m = 0; m < n_ch; ++m) {
+                    sel[f * n_ch + m] = pcm[f * cap_ch + sel_idx[m]];
+                }
+            }
+            feed = sel.data();
+        }
+        if (loc.Process(feed, nf, n_ch)) {
             ++rdy;
             const auto r = loc.GetResult();
             conf_milli.store(static_cast<int>(r.confidence * 1000.0f));
-            if (r.valid) {
-                ++vld;
-                std::printf("\r[%04d] az: %7.2f° | conf: %.3f | qual: %.3f | clos: %.2f us    ",
-                            rdy.load(), r.azimuth_deg, r.confidence, r.quality,
-                            r.closure_residual_sec * 1e6f);
-                std::fflush(stdout);
-            } else if (verbose) {
-                std::printf("\r[%04d] az: ------- | conf: %.3f    ",
-                            rdy.load(), r.confidence);
-                std::fflush(stdout);
+            if (r.valid) ++vld;
+            {
+                std::lock_guard<std::mutex> lk(res_mu);
+                last_r = r;
+                last_rdy = rdy.load();
+                have_r = true;
             }
         }
     });
-    if (!cap.Start(sample_rate, n_ch, chunk)) {
+    if (!cap.Start(sample_rate, cap_ch, chunk)) {
         std::fprintf(stderr, "Failed to start capture\n"); return 1;
     }
-    std::printf("=== Live %dch Capture ===\nside: %.4f m | rate: %d Hz | device: %d\nPress Ctrl+C to stop.\n\n",
-                n_ch, mic_distance, sample_rate, device_index);
+    std::printf("=== Live Capture ===\ncapture: %dch | DOA mics: %d | side: %.4f m | "
+                "rate: %d Hz | device: %d\n",
+                cap_ch, n_ch, mic_distance, sample_rate, device_index);
+    if (!identity) {
+        std::printf("channel map (1-based): ");
+        for (int m = 0; m < n_ch; ++m) {
+            std::printf("ch%d->mic%d%s", sel_idx[m] + 1, m,
+                        m + 1 < n_ch ? ", " : "\n");
+        }
+    }
+    std::printf("Press Ctrl+C to stop.\n\n");
     g_stop_requested = 0;
     std::signal(SIGINT, HandleSignal);
     std::signal(SIGTERM, HandleSignal);
-    while (!g_stop_requested) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    while (!g_stop_requested) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        SpacemitAudio::MultiSoundLocatorResult r;
+        int idx = 0;
+        bool ok = false;
+        {
+            std::lock_guard<std::mutex> lk(res_mu);
+            r = last_r;
+            idx = last_rdy;
+            ok = have_r;
+        }
+        if (!ok) continue;
+        if (r.valid) {
+            std::printf("\r[%04d] az: %7.2f° | conf: %.3f | qual: %.3f | clos: %.2f us    ",
+                        idx, r.azimuth_deg, r.confidence, r.quality,
+                        r.closure_residual_sec * 1e6f);
+            std::fflush(stdout);
+        } else if (verbose) {
+            std::printf("\r[%04d] az: ------- | conf: %.3f    ",
+                        idx, r.confidence);
+            std::fflush(stdout);
+        }
+    }
     cap.Stop();
     std::printf("\nStopped. callbacks: %d, frames: %d, valid: %d\n",
                 cb.load(), rdy.load(), vld.load());
@@ -763,7 +849,7 @@ void PrintUsage(const char* prog) {
 #ifdef HAS_SPACEMIT_AUDIO
     std::printf("  %s -c 3 -l [-d M] [-r RATE] [-i DEV] [-v]\n", prog);
     std::printf("                   [--positions SPEC] [--azimuth-offset DEG]\n");
-    std::printf("                   [--avg-seconds S]\n");
+    std::printf("                   [--avg-seconds S] [--capture-channels N] [--pick i,j,k]\n");
 #endif
     std::printf("\n");
     std::printf("  %s -h | --help\n\n", prog);
@@ -800,6 +886,16 @@ void PrintUsage(const char* prog) {
     std::printf("                              only; default 2.0; set ≤0 to disable gate)\n");
     std::printf("  --max-frequency-hz F       Override config.max_frequency_hz (default 0 =\n");
     std::printf("                              auto alias-safe c / 2·d_max)\n");
+#ifdef HAS_SPACEMIT_AUDIO
+    std::printf("\nLive (-l) channel selection (e.g. 4-mic: ch1=AEC ref, ch2-4=DOA):\n");
+    std::printf("  --capture-channels N       Open N device channels (default = DOA mic\n");
+    std::printf("                              count). Use when the device exposes extra\n");
+    std::printf("                              channels (AEC ref / loopback).\n");
+    std::printf("  --pick i,j,k               1-based capture channels feeding DOA mics,\n");
+    std::printf("                              one per mic. Required when --capture-channels\n");
+    std::printf("                              != mic count. e.g. --capture-channels 4\n");
+    std::printf("                              --pick 2,3,4 drops the ch1 AEC reference.\n");
+#endif
 }
 
 struct Args {
@@ -820,6 +916,8 @@ struct Args {
     float max_avg_seconds = 0.0f;
     std::vector<SpacemitAudio::MicrophonePosition> positions_override;
     MultiOverrides multi_overrides;
+    int capture_channels = 0;       // 0 = same as DOA mic count (current behavior)
+    std::vector<int> pick;          // 1-based capture-channel -> DOA mic map; empty = identity
     bool help = false;
 };
 
@@ -877,6 +975,15 @@ bool ParseArgs(int argc, char* argv[], Args& a) {
         } else if (std::strcmp(s, "--max-frequency-hz") == 0 && i + 1 < argc) {
             a.multi_overrides.have_max_freq = true;
             a.multi_overrides.max_frequency_hz = static_cast<float>(std::atof(argv[++i]));
+        } else if (std::strcmp(s, "--capture-channels") == 0 && i + 1 < argc) {
+            a.capture_channels = std::atoi(argv[++i]);
+        } else if (std::strcmp(s, "--pick") == 0 && i + 1 < argc) {
+            a.pick.clear();
+            for (const char* p = argv[++i]; *p != '\0';) {
+                a.pick.push_back(std::atoi(p));
+                while (*p != '\0' && *p != ',') ++p;
+                if (*p == ',') ++p;
+            }
         } else if (s[0] == '-') {
             std::fprintf(stderr, "Unknown flag: %s\n", s);
             return false;
@@ -998,7 +1105,8 @@ int main(int argc, char* argv[]) {
 #ifdef HAS_SPACEMIT_AUDIO
                 return RunLive_3ch(a.mic_distance, a.sample_rate, a.device_index,
                     a.verbose, a.az_offset, a.max_avg_seconds,
-                    a.positions_override, a.multi_overrides);
+                    a.positions_override, a.multi_overrides,
+                    a.capture_channels, a.pick);
 #else
                 std::fprintf(stderr,
                     "Live mode disabled: spacemit_audio not found at build time\n");

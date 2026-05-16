@@ -110,6 +110,22 @@ cmake --build build -j$(nproc)
 ./build/bin/ssl_demo -c 3 -f 3ch.wav    -d 0.063 --azimuth-offset 180
 ```
 
+**实时麦克风（`-l`，需构建时找到 spacemit_audio）：**
+
+`-r` 必须等于采集设备的实际采样率（用 `cat /proc/asound/card<N>/stream0`
+或 `arecord -l` 查）。设备相关：板载 codec `snd-es8326` 只支持 48000；
+USB 麦克风阵列常见 16000。`--avg-seconds` 在 live 下务必设正值（默认 0 是
+无界累积）。
+```bash
+# 3 路麦克风直接采集（采样率按设备填，例：USB 16k）
+./build/bin/ssl_demo -c 3 -l -d 0.063 -r 16000 --avg-seconds 3
+
+# 4 路麦克风：ch1 = AEC 参考(丢弃)，ch2/3/4 = DOA 三路。
+# 已在 K3 实测：USB SPV 4-mic，16000 Hz，device 0。
+./build/bin/ssl_demo -c 3 -l -d 0.063 -r 16000 -i 0 \
+    --capture-channels 4 --pick 2,3,4 --avg-seconds 3 -v
+```
+
 **Python 绑定安装与测试：**
 ```bash
 make -C build audio_process-install-python
