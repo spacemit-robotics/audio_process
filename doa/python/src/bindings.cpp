@@ -62,7 +62,8 @@ public:
     void reset() { loc_.Reset(); }
 
     // Interleaved float32 numpy array [L, R, L, R, ...]
-    bool process_float(py::array_t<float> interleaved) {
+    bool process_float(
+        py::array_t<float, py::array::c_style | py::array::forcecast> interleaved) {
         auto buf = interleaved.request();
         if (buf.ndim != 1) {
             throw std::runtime_error("Expected 1-D array for interleaved data");
@@ -77,7 +78,8 @@ public:
     }
 
     // Interleaved int16 numpy array
-    bool process_int16(py::array_t<int16_t> interleaved) {
+    bool process_int16(
+        py::array_t<int16_t, py::array::c_style | py::array::forcecast> interleaved) {
         auto buf = interleaved.request();
         if (buf.ndim != 1) {
             throw std::runtime_error("Expected 1-D array for interleaved data");
@@ -92,7 +94,9 @@ public:
     }
 
     // Two separate float32 numpy arrays
-    bool process_separate(py::array_t<float> ch0, py::array_t<float> ch1) {
+    bool process_separate(
+        py::array_t<float, py::array::c_style | py::array::forcecast> ch0,
+        py::array_t<float, py::array::c_style | py::array::forcecast> ch1) {
         auto b0 = ch0.request();
         auto b1 = ch1.request();
         if (b0.ndim != 1 || b1.ndim != 1) {
@@ -382,9 +386,14 @@ PYBIND11_MODULE(_spacemit_audio_process, m) {
         // [A5] quality threshold (default 0.0 = disabled; v1 backward-compat)
         .def_readwrite("quality_threshold",
             &MultiSoundLocatorConfig::quality_threshold)
-        // [A2] TDOA closure threshold in samples (default 2.0; N=3 only)
+        // [A2/P1.1] TDOA closure threshold (N=3 only). Effective threshold =
+        // max(closure_threshold_samples, closure_threshold_fraction *
+        // max_physical_TDOA_samples). P1.1 default samples=0.0, fraction=0.3
+        // is array-scale invariant; set both <= 0 to disable the gate.
         .def_readwrite("closure_threshold_samples",
             &MultiSoundLocatorConfig::closure_threshold_samples)
+        .def_readwrite("closure_threshold_fraction",
+            &MultiSoundLocatorConfig::closure_threshold_fraction)
         .def("__repr__", [](const MultiSoundLocatorConfig& c) {
             return "<MultiSoundLocatorConfig sr=" + std::to_string(c.sample_rate)
                 + " channels=" + std::to_string(c.microphones.size())
