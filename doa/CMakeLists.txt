@@ -107,11 +107,34 @@ if(AUDIO_PROCESS_BUILD_EXAMPLES)
         target_include_directories(ssl_demo PRIVATE ${SPACE_AUDIO_INC})
         target_link_libraries(ssl_demo PRIVATE ${SPACE_AUDIO_LIB})
 
-        # PortAudio (transitive dep of spacemit_audio)
-        pkg_check_modules(PORTAUDIO portaudio-2.0)
-        if(PORTAUDIO_FOUND)
-            target_link_libraries(ssl_demo PRIVATE ${PORTAUDIO_LIBRARIES})
-            target_link_directories(ssl_demo PRIVATE ${PORTAUDIO_LIBRARY_DIRS})
+        # PortAudio (transitive dep of the static libspacemit_audio). Prefer
+        # the ALSA-only PortAudio the audio component bundled + installed next
+        # to libspacemit_audio: the system pkg-config PortAudio is commonly
+        # built with the JACK host API, whose Pa_Initialize() returns
+        # "Unanticipated host error" on boards with no JACK server. Link the
+        # static archive so there is no runtime .so resolution ambiguity
+        # (mirrors how the audio component links audio_demo). Fall back to
+        # pkg-config only when the bundled archive is absent.
+        get_filename_component(_sa_libdir "${SPACE_AUDIO_LIB}" DIRECTORY)
+        find_library(PORTAUDIO_BUNDLED
+            NAMES libportaudio.a portaudio
+            HINTS "${_sa_libdir}" NO_DEFAULT_PATH)
+        if(PORTAUDIO_BUNDLED)
+            find_package(Threads REQUIRED)
+            find_library(ASOUND_LIB NAMES asound)
+            target_link_libraries(ssl_demo PRIVATE ${PORTAUDIO_BUNDLED} Threads::Threads)
+            if(ASOUND_LIB)
+                target_link_libraries(ssl_demo PRIVATE ${ASOUND_LIB})
+            endif()
+            message(STATUS "[audio_process] ssl_demo: portaudio=${PORTAUDIO_BUNDLED} (bundled ALSA-only)")
+        else()
+            pkg_check_modules(PORTAUDIO portaudio-2.0)
+            if(PORTAUDIO_FOUND)
+                target_link_libraries(ssl_demo PRIVATE ${PORTAUDIO_LIBRARIES})
+                target_link_directories(ssl_demo PRIVATE ${PORTAUDIO_LIBRARY_DIRS})
+            endif()
+            message(WARNING "[audio_process] ssl_demo: using system pkg-config PortAudio "
+                "(bundled not found); live mode may hit JACK Pa_Initialize errors")
         endif()
         message(STATUS "[audio_process] ssl_demo: live mode enabled (spacemit_audio found)")
     else()
