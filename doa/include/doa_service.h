@@ -84,8 +84,9 @@
  *    - `max_avg_seconds = 0` (default) keeps the GetAverageAzimuth window
  *      UNBOUNDED since the last Reset() — fine for one-shot batches, but
  *      causes unbounded memory growth in live capture / long sessions.
- *    - For live mic / streaming, set `max_avg_seconds` to the time window
- *      you actually want (e.g. 5–30 s).
+ *    - Live mic / streaming integrations MUST set `max_avg_seconds` to the
+ *      time window they actually want (e.g. 5–30 s), or call Reset()
+ *      periodically.
  * ===========================================================================
  */
 
@@ -235,6 +236,9 @@ struct MultiSoundLocatorConfig {
 
     /// GetAverageAzimuth sliding-window length (seconds).
     /// 0  = unbounded since the last Reset() (default, backward compat).
+    ///      WARNING: live / streaming integrations MUST set this > 0 or call
+    ///      Reset() periodically, otherwise history memory grows for the full
+    ///      session.
     /// >0 = keep only the most recent ceil(max_avg_seconds / batch_seconds)
     ///      batches in the running mean (useful for streaming / moving sources
     ///      to bound memory).

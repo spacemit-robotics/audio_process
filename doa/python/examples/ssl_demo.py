@@ -202,6 +202,10 @@ def run_file_2ch(path: str, mic_dist: float, verbose: bool, flip: bool) -> int:
               file=sys.stderr)
         wf.close()
         return 1
+    if n_frames == 0:
+        print("WAV contains no audio frames", file=sys.stderr)
+        wf.close()
+        return 1
     raw = wf.readframes(n_frames)
     wf.close()
     samples = np.frombuffer(raw, dtype=np.int16)
@@ -492,6 +496,8 @@ def make_multi_cfg(args, sample_rate: int) -> MultiSoundLocatorConfig:
         cfg.margin_threshold = args.margin_threshold
     if args.closure_threshold_samples is not None:
         cfg.closure_threshold_samples = args.closure_threshold_samples
+    if args.closure_threshold_fraction is not None:
+        cfg.closure_threshold_fraction = args.closure_threshold_fraction
     if args.max_frequency_hz is not None:
         cfg.max_frequency_hz = args.max_frequency_hz
     return cfg
@@ -570,6 +576,10 @@ def run_file_multi(path: str, args) -> int:
     if sampwidth != 2:
         print(f"Only PCM16 WAV supported (got {sampwidth * 8}-bit)",
               file=sys.stderr)
+        wf.close()
+        return 1
+    if n_frames == 0:
+        print("WAV contains no audio frames", file=sys.stderr)
         wf.close()
         return 1
     raw = wf.readframes(n_frames)
@@ -761,7 +771,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Override config.margin_threshold (default 0.6)")
     p.add_argument("--closure-threshold-samples", type=float, default=None,
                    help=("Override config.closure_threshold_samples "
-                         "(N=3 only; default 2.0; <=0 disables gate)"))
+                         "(N=3 only; default 0.0; effective=max(samples, "
+                         "fraction*physical_max))"))
+    p.add_argument("--closure-threshold-fraction", type=float, default=None,
+                   help=("Override config.closure_threshold_fraction "
+                         "(N=3 only; default 0.3; set both closure "
+                         "thresholds <=0 to disable gate)"))
     p.add_argument("--max-frequency-hz", type=float, default=None,
                    help=("Override config.max_frequency_hz (default 0 "
                          "= auto alias-safe c / 2·d_max)"))

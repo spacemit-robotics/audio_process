@@ -13,7 +13,8 @@
  *                    [--azimuth-offset DEG] [--positions SPEC]
  *                    [--avg-seconds S]
  *                    [--quality-threshold F] [--margin-threshold F]
- *                    [--closure-threshold-samples F] [--max-frequency-hz F]
+ *                    [--closure-threshold-samples F]
+ *                    [--closure-threshold-fraction F] [--max-frequency-hz F]
  *   ssl_demo -c 3 -f 3ch.wav [-d M] [-v] [--positions SPEC]
  *                    [--azimuth-offset DEG] [--avg-seconds S]
  *   ssl_demo -c 3 -l [-d M] [-r RATE] [-i DEV] [-v]
@@ -36,6 +37,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <random>
@@ -63,9 +65,15 @@ constexpr int kLanczosTaps = 31;
 constexpr int kLanczosHalf = kLanczosTaps / 2;
 constexpr float kDefault2chMicDistance = 0.058f;
 constexpr float kDefault3chMicDistance = 0.063f;
+constexpr float kDefaultLiveAvgSeconds = 10.0f;
 
 struct WavData {
     std::vector<int16_t> samples;
+    int channels = 0;
+    int sample_rate = 0;
+};
+
+struct WavHeaderInfo {
     int channels = 0;
     int sample_rate = 0;
 };
@@ -80,6 +88,70 @@ float NormalizeAngle360(float degrees) {
 float CircularError(float a, float b) {
     float diff = std::fabs(NormalizeAngle360(a) - NormalizeAngle360(b));
     return std::min(diff, 360.0f - diff);
+}
+
+bool ReadWavHeader(const char* path, WavHeaderInfo& info) {
+    FILE* f = std::fopen(path, "rb");
+    if (!f) {
+        std::fprintf(stderr, "Cannot open %s\n", path);
+        return false;
+    }
+
+    char riff[4]; uint32_t riff_size = 0; char wave[4];
+    if (std::fread(riff, 1, 4, f) != 4
+        || std::fread(&riff_size, sizeof(riff_size), 1, f) != 1
+        || std::fread(wave, 1, 4, f) != 4
+        || std::memcmp(riff, "RIFF", 4) != 0
+        || std::memcmp(wave, "WAVE", 4) != 0) {
+        std::fclose(f);
+        std::fprintf(stderr, "Not a WAV file\n");
+        return false;
+    }
+
+    while (!std::feof(f)) {
+        char chunk_id[4]; uint32_t chunk_size = 0;
+        if (std::fread(chunk_id, 1, 4, f) != 4
+            || std::fread(&chunk_size, sizeof(chunk_size), 1, f) != 1) break;
+
+        if (std::memcmp(chunk_id, "fmt ", 4) == 0) {
+            if (chunk_size < 16) {
+                std::fclose(f);
+                std::fprintf(stderr, "Invalid WAV fmt chunk\n");
+                return false;
+            }
+            uint16_t audio_format = 0, channels = 0, bits_per_sample = 0;
+            uint32_t sample_rate = 0, byte_rate = 0; uint16_t block_align = 0;
+            if (std::fread(&audio_format, sizeof(audio_format), 1, f) != 1
+                || std::fread(&channels, sizeof(channels), 1, f) != 1
+                || std::fread(&sample_rate, sizeof(sample_rate), 1, f) != 1
+                || std::fread(&byte_rate, sizeof(byte_rate), 1, f) != 1
+                || std::fread(&block_align, sizeof(block_align), 1, f) != 1
+                || std::fread(&bits_per_sample, sizeof(bits_per_sample), 1, f) != 1) {
+                std::fclose(f);
+                std::fprintf(stderr, "Failed to read WAV fmt chunk\n");
+                return false;
+            }
+            std::fclose(f);
+            if (audio_format != 1 || bits_per_sample != 16) {
+                std::fprintf(stderr, "Only PCM16 WAV is supported\n");
+                return false;
+            }
+            if (channels == 0) {
+                std::fprintf(stderr, "Invalid WAV channel count: 0\n");
+                return false;
+            }
+            info.channels = static_cast<int>(channels);
+            info.sample_rate = static_cast<int>(sample_rate);
+            return true;
+        }
+
+        std::fseek(f, static_cast<int64_t>(chunk_size), SEEK_CUR);
+        if (chunk_size % 2 != 0) std::fseek(f, 1, SEEK_CUR);
+    }
+
+    std::fclose(f);
+    std::fprintf(stderr, "No fmt chunk found\n");
+    return false;
 }
 
 // Read a PCM16 WAV of any channel count.
@@ -311,6 +383,10 @@ int RunFile_2ch(const char* path, float mic_distance, bool verbose, bool flip) {
     }
 
     const size_t n_total = wav.samples.size() / 2;
+    if (n_total == 0) {
+        std::fprintf(stderr, "WAV contains no audio frames\n");
+        return 1;
+    }
     const float dur = static_cast<float>(n_total) / wav.sample_rate;
     size_t off = 0; int fno = 0;
     const auto t0 = std::chrono::steady_clock::now();
@@ -365,7 +441,13 @@ int RunLive_2ch(float mic_distance, int sample_rate, int device_index,
     const int chunk = cfg.frame_size * 2 * 2;
     SpacemitAudio::Init(sample_rate, 2, chunk, device_index, -1);
     SpacemitAudio::AudioCapture cap(device_index);
-    std::atomic<int> cb{0}, rdy{0}, vld{0}, conf_milli{0};
+    std::atomic<int> cb{0}, rdy{0}, vld{0};
+    std::mutex res_mu;
+    float last_doa = 0.0f;
+    float last_confidence = 0.0f;
+    int last_rdy = 0;
+    bool last_valid = false;
+    bool have_result = false;
 
     cap.SetCallback([&](const uint8_t* d, size_t s) {
         ++cb;
@@ -373,17 +455,17 @@ int RunLive_2ch(float mic_distance, int sample_rate, int device_index,
         const auto* pcm = reinterpret_cast<const int16_t*>(d);
         if (loc.Process(pcm, nf)) {
             ++rdy;
-            conf_milli.store(static_cast<int>(loc.GetConfidence() * 1000.0f));
-            if (loc.IsValid()) {
+            const bool valid = loc.IsValid();
+            if (valid) {
                 ++vld;
-                std::printf("\r[%04d] DOA: %7.2f° | Conf: %.3f    ",
-                            rdy.load(), ReportAngle2ch(loc.GetDOA(), flip),
-                            loc.GetConfidence());
-                std::fflush(stdout);
-            } else if (verbose) {
-                std::printf("\r[%04d] DOA: ------- | Conf: %.3f    ",
-                            rdy.load(), loc.GetConfidence());
-                std::fflush(stdout);
+            }
+            {
+                std::lock_guard<std::mutex> lk(res_mu);
+                last_doa = ReportAngle2ch(loc.GetDOA(), flip);
+                last_confidence = loc.GetConfidence();
+                last_rdy = rdy.load();
+                last_valid = valid;
+                have_result = true;
             }
         }
     });
@@ -394,7 +476,32 @@ int RunLive_2ch(float mic_distance, int sample_rate, int device_index,
     g_stop_requested = 0;
     std::signal(SIGINT, HandleSignal);
     std::signal(SIGTERM, HandleSignal);
-    while (!g_stop_requested) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    while (!g_stop_requested) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        float doa = 0.0f;
+        float confidence = 0.0f;
+        int idx = 0;
+        bool valid = false;
+        bool ok = false;
+        {
+            std::lock_guard<std::mutex> lk(res_mu);
+            doa = last_doa;
+            confidence = last_confidence;
+            idx = last_rdy;
+            valid = last_valid;
+            ok = have_result;
+        }
+        if (!ok) continue;
+        if (valid) {
+            std::printf("\r[%04d] DOA: %7.2f° | Conf: %.3f    ",
+                        idx, doa, confidence);
+            std::fflush(stdout);
+        } else if (verbose) {
+            std::printf("\r[%04d] DOA: ------- | Conf: %.3f    ",
+                        idx, confidence);
+            std::fflush(stdout);
+        }
+    }
     cap.Stop();
     std::printf("\nStopped. callbacks: %d, frames: %d, valid: %d\n",
                 cb.load(), rdy.load(), vld.load());
@@ -541,6 +648,8 @@ bool ParsePositions(const std::string& spec,
 
 struct MultiOverrides {
     bool have_closure = false;     float closure_threshold_samples = 0;
+    bool have_closure_fraction = false;
+    float closure_threshold_fraction = 0;
     bool have_quality = false;     float quality_threshold = 0;
     bool have_margin = false;      float margin_threshold = 0;
     bool have_max_freq = false;    float max_frequency_hz = 0;
@@ -562,6 +671,9 @@ SpacemitAudio::MultiSoundLocatorConfig MakeMultiConfig(
     cfg.azimuth_offset_deg = az_offset;
     cfg.max_avg_seconds = max_avg_seconds;
     if (ov.have_closure)  cfg.closure_threshold_samples = ov.closure_threshold_samples;
+    if (ov.have_closure_fraction) {
+        cfg.closure_threshold_fraction = ov.closure_threshold_fraction;
+    }
     if (ov.have_quality)  cfg.quality_threshold = ov.quality_threshold;
     if (ov.have_margin)   cfg.margin_threshold = ov.margin_threshold;
     if (ov.have_max_freq) cfg.max_frequency_hz = ov.max_frequency_hz;
@@ -644,6 +756,10 @@ int RunFile_3ch(const char* path, float mic_distance, bool verbose,
     }
 
     const size_t n_total = wav.samples.size() / wav.channels;
+    if (n_total == 0) {
+        std::fprintf(stderr, "WAV contains no audio frames\n");
+        return 1;
+    }
     const float dur = static_cast<float>(n_total) / wav.sample_rate;
     std::printf("=== %dch WAV File: %s ===\n", wav.channels, path);
     std::printf("Sample rate: %d Hz | Frames: %zu | Duration: %.2f s\n",
@@ -694,6 +810,12 @@ int RunLive_3ch(float mic_distance, int sample_rate, int device_index,
     auto cfg = MakeMultiConfig(mic_distance, sample_rate, az_offset,
         max_avg_seconds, positions_override, ov);
     const int n_ch = static_cast<int>(cfg.microphones.size());
+    if (capture_channels < 0) {
+        std::fprintf(stderr,
+            "Error: --capture-channels must be >= 0 (got %d)\n",
+            capture_channels);
+        return 1;
+    }
     const int cap_ch = capture_channels > 0 ? capture_channels : n_ch;
     if (cap_ch < n_ch) {
         std::fprintf(stderr,
@@ -727,6 +849,15 @@ int RunLive_3ch(float mic_distance, int sample_rate, int device_index,
             }
             sel_idx.push_back(v - 1);
         }
+        std::vector<bool> seen(static_cast<size_t>(cap_ch), false);
+        for (int idx : sel_idx) {
+            if (seen[static_cast<size_t>(idx)]) {
+                std::fprintf(stderr,
+                    "Error: --pick repeats capture channel %d\n", idx + 1);
+                return 1;
+            }
+            seen[static_cast<size_t>(idx)] = true;
+        }
     }
     const bool identity = (cap_ch == n_ch) && pick.empty();
 
@@ -738,9 +869,12 @@ int RunLive_3ch(float mic_distance, int sample_rate, int device_index,
 
     const int chunk = cfg.frame_size * cap_ch * sizeof(int16_t);
     SpacemitAudio::Init(sample_rate, cap_ch, chunk, device_index, -1);
-    SpacemitAudio::AudioCapture cap(device_index);
-    std::atomic<int> cb{0}, rdy{0}, vld{0}, conf_milli{0};
+    std::atomic<int> cb{0}, rdy{0}, vld{0};
     std::vector<int16_t> sel;  // persistent deinterleave buffer (non-identity)
+    if (!identity) {
+        sel.resize(static_cast<size_t>(cfg.frame_size)
+            * static_cast<size_t>(n_ch));
+    }
 
     // Real-time rule: the audio callback must not block on console I/O. A slow
     // tty (ssh pty) write inside it stalls the ALSA read, overruns the capture
@@ -751,33 +885,59 @@ int RunLive_3ch(float mic_distance, int sample_rate, int device_index,
     SpacemitAudio::MultiSoundLocatorResult last_r{};
     int last_rdy = 0;
     bool have_r = false;
+    std::mutex err_mu;
+    char callback_error[256] = "";
+    std::atomic<bool> callback_failed{false};
+    std::atomic<int> callback_errors{0};
 
+    auto record_callback_error = [&](const char* msg) {
+        callback_failed.store(true, std::memory_order_relaxed);
+        if (callback_errors.fetch_add(1, std::memory_order_relaxed) == 0) {
+            std::lock_guard<std::mutex> lk(err_mu);
+            std::snprintf(callback_error, sizeof(callback_error), "%s",
+                msg ? msg : "unknown callback error");
+        }
+    };
+
+    // Construct capture after callback state so destructor order stops/closes
+    // the stream before any referenced callback state is destroyed.
+    SpacemitAudio::AudioCapture cap(device_index);
     cap.SetCallback([&](const uint8_t* d, size_t s) {
-        ++cb;
-        const size_t nf = s / (cap_ch * sizeof(int16_t));
-        if (nf == 0) return;
-        const auto* pcm = reinterpret_cast<const int16_t*>(d);
-        const int16_t* feed = pcm;
-        if (!identity) {
-            sel.resize(nf * static_cast<size_t>(n_ch));
-            for (size_t f = 0; f < nf; ++f) {
-                for (int m = 0; m < n_ch; ++m) {
-                    sel[f * n_ch + m] = pcm[f * cap_ch + sel_idx[m]];
+        if (callback_failed.load(std::memory_order_relaxed)) return;
+        try {
+            ++cb;
+            const size_t nf = s / (cap_ch * sizeof(int16_t));
+            if (nf == 0) return;
+            const auto* pcm = reinterpret_cast<const int16_t*>(d);
+            const int16_t* feed = pcm;
+            if (!identity) {
+                const size_t needed = nf * static_cast<size_t>(n_ch);
+                if (sel.size() < needed) {
+                    record_callback_error("capture callback exceeded preallocated frame buffer");
+                    return;
+                }
+                for (size_t f = 0; f < nf; ++f) {
+                    for (int m = 0; m < n_ch; ++m) {
+                        sel[f * n_ch + m] = pcm[f * cap_ch + sel_idx[m]];
+                    }
+                }
+                feed = sel.data();
+            }
+            if (loc.Process(feed, nf, n_ch)) {
+                ++rdy;
+                const auto r = loc.GetResult();
+                if (r.valid) ++vld;
+                {
+                    std::lock_guard<std::mutex> lk(res_mu);
+                    last_r = r;
+                    last_rdy = rdy.load();
+                    have_r = true;
                 }
             }
-            feed = sel.data();
-        }
-        if (loc.Process(feed, nf, n_ch)) {
-            ++rdy;
-            const auto r = loc.GetResult();
-            conf_milli.store(static_cast<int>(r.confidence * 1000.0f));
-            if (r.valid) ++vld;
-            {
-                std::lock_guard<std::mutex> lk(res_mu);
-                last_r = r;
-                last_rdy = rdy.load();
-                have_r = true;
-            }
+        } catch (const std::exception& e) {
+            record_callback_error(e.what());
+        } catch (...) {
+            record_callback_error("unknown callback exception");
         }
     });
     if (!cap.Start(sample_rate, cap_ch, chunk)) {
@@ -799,6 +959,15 @@ int RunLive_3ch(float mic_distance, int sample_rate, int device_index,
     std::signal(SIGTERM, HandleSignal);
     while (!g_stop_requested) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (callback_failed.load(std::memory_order_relaxed)) {
+            char message[sizeof(callback_error)] = "";
+            {
+                std::lock_guard<std::mutex> lk(err_mu);
+                std::snprintf(message, sizeof(message), "%s", callback_error);
+            }
+            std::fprintf(stderr, "\nAudio callback failed: %s\n", message);
+            break;
+        }
         SpacemitAudio::MultiSoundLocatorResult r;
         int idx = 0;
         bool ok = false;
@@ -843,7 +1012,7 @@ void PrintUsage(const char* prog) {
     std::printf("                   [--azimuth-offset DEG] [--positions SPEC]\n");
     std::printf("                   [--avg-seconds S] [--quality-threshold F]\n");
     std::printf("                   [--margin-threshold F] [--closure-threshold-samples F]\n");
-    std::printf("                   [--max-frequency-hz F]\n");
+    std::printf("                   [--closure-threshold-fraction F] [--max-frequency-hz F]\n");
     std::printf("  %s -c 3 -f Nch.wav [-d M] [-v] [--positions SPEC]\n", prog);
     std::printf("                   [--azimuth-offset DEG] [--avg-seconds S]\n");
 #ifdef HAS_SPACEMIT_AUDIO
@@ -876,14 +1045,20 @@ void PrintUsage(const char* prog) {
     std::printf("  --azimuth-offset DEG       Array → robot frame offset (degrees)\n");
     std::printf("  --positions x0,y0;x1,y1... Override mic positions (N>=2; skips equilateral)\n");
     std::printf("  --avg-seconds S            Sliding-window length for GetAverageAzimuth.\n");
-    std::printf("                              Default 0 = unbounded since Reset — use a\n");
-    std::printf("                              positive value for live capture / long sessions\n");
-    std::printf("                              to bound memory.\n");
+    std::printf("                              Default: 0 for test/file, %.0fs for live.\n",
+                kDefaultLiveAvgSeconds);
+    std::printf("                              Pass 0 explicitly in live mode for unbounded\n");
+    std::printf("                              history since Reset.\n");
     std::printf("  --quality-threshold F      Override config.quality_threshold (default 0.0)\n");
     std::printf("  --margin-threshold F       Override config.margin_threshold (default 0.6)\n");
     std::printf("  --closure-threshold-samples F\n");
-    std::printf("                              Override config.closure_threshold_samples (N=3\n");
-    std::printf("                              only; default 2.0; set ≤0 to disable gate)\n");
+    std::printf("                              Explicit closure cap in samples (N=3 only;\n");
+    std::printf("                              default 0.0; effective=max(samples,\n");
+    std::printf("                              fraction*physical_max))\n");
+    std::printf("  --closure-threshold-fraction F\n");
+    std::printf("                              Closure cap as fraction of max physical TDOA\n");
+    std::printf("                              (N=3 only; default 0.3). Set both closure\n");
+    std::printf("                              thresholds <=0 to disable the gate.\n");
     std::printf("  --max-frequency-hz F       Override config.max_frequency_hz (default 0 =\n");
     std::printf("                              auto alias-safe c / 2·d_max)\n");
 #ifdef HAS_SPACEMIT_AUDIO
@@ -914,6 +1089,7 @@ struct Args {
     float az_offset = 0.0f;
     float noise_snr_db = std::numeric_limits<float>::infinity();
     float max_avg_seconds = 0.0f;
+    bool avg_seconds_set = false;
     std::vector<SpacemitAudio::MicrophonePosition> positions_override;
     MultiOverrides multi_overrides;
     int capture_channels = 0;       // 0 = same as DOA mic count (current behavior)
@@ -957,6 +1133,7 @@ bool ParseArgs(int argc, char* argv[], Args& a) {
             a.az_offset = static_cast<float>(std::atof(argv[++i]));
         } else if (std::strcmp(s, "--avg-seconds") == 0 && i + 1 < argc) {
             a.max_avg_seconds = static_cast<float>(std::atof(argv[++i]));
+            a.avg_seconds_set = true;
         } else if (std::strcmp(s, "--positions") == 0 && i + 1 < argc) {
             if (!ParsePositions(argv[++i], a.positions_override)) {
                 std::fprintf(stderr, "Error: --positions must be N>=2 mics 'x,y[,z];...'\n");
@@ -971,6 +1148,11 @@ bool ParseArgs(int argc, char* argv[], Args& a) {
         } else if (std::strcmp(s, "--closure-threshold-samples") == 0 && i + 1 < argc) {
             a.multi_overrides.have_closure = true;
             a.multi_overrides.closure_threshold_samples =
+                static_cast<float>(std::atof(argv[++i]));
+        } else if (std::strcmp(s, "--closure-threshold-fraction") == 0
+            && i + 1 < argc) {
+            a.multi_overrides.have_closure_fraction = true;
+            a.multi_overrides.closure_threshold_fraction =
                 static_cast<float>(std::atof(argv[++i]));
         } else if (std::strcmp(s, "--max-frequency-hz") == 0 && i + 1 < argc) {
             a.multi_overrides.have_max_freq = true;
@@ -1017,8 +1199,8 @@ int main(int argc, char* argv[]) {
 
     // Auto-detect channels from WAV in file mode if -c was omitted.
     if (a.channels == 0 && a.mode == Args::FILE && a.wav_path) {
-        WavData probe;
-        if (!ReadWav(a.wav_path, probe)) return 1;
+        WavHeaderInfo probe;
+        if (!ReadWavHeader(a.wav_path, probe)) return 1;
         a.channels = probe.channels;
         std::printf("[ssl_demo] auto-detected -c %d from WAV header\n", a.channels);
     }
@@ -1103,10 +1285,14 @@ int main(int argc, char* argv[]) {
                     a.positions_override, a.multi_overrides);
             case Args::LIVE:
 #ifdef HAS_SPACEMIT_AUDIO
+            {
+                const float max_avg_seconds = a.avg_seconds_set
+                    ? a.max_avg_seconds : kDefaultLiveAvgSeconds;
                 return RunLive_3ch(a.mic_distance, a.sample_rate, a.device_index,
-                    a.verbose, a.az_offset, a.max_avg_seconds,
+                    a.verbose, a.az_offset, max_avg_seconds,
                     a.positions_override, a.multi_overrides,
                     a.capture_channels, a.pick);
+            }
 #else
                 std::fprintf(stderr,
                     "Live mode disabled: spacemit_audio not found at build time\n");
