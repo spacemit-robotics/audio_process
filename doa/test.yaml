@@ -1,0 +1,35 @@
+module: components/multimedia/audio_process/doa
+
+tests:
+  - name: doa-synthetic-gcc-contract
+    description: Verifies DOA GCC-PHAT behavior on synthetic broadside audio and multi-channel geometry without microphones.
+    category: functional
+    scopes: [pr]
+    timeout_s: 120
+    workdir: sdk
+    command: |
+      bash components/multimedia/audio_process/doa/tests/test_synthetic_gcc_contract.sh
+
+  - name: doa-invalid-input-error-path
+    description: Verifies DOA processing before initialization, invalid configs, wrong channel counts, and bad accessor arguments fail explicitly.
+    category: functional
+    scopes: [pr]
+    timeout_s: 120
+    workdir: sdk
+    command: |
+      bash components/multimedia/audio_process/doa/tests/test_invalid_input_error_path.sh
+
+  - name: doa-manual-microphone-smoke
+    description: Manually opens a real multi-mic device only when DOA_MANUAL_RUN=1 and runs live DOA for a bounded duration.
+    category: functional
+    scopes: [manual]
+    timeout_s: 180
+    workdir: sdk
+    requires:
+      hardware: ["multi-mic-audio-device"]
+      env: ["DOA_MANUAL_RUN"]
+      human_watch: true
+    artifacts:
+      - doa-manual-microphone-smoke.log
+    command: |
+      bash components/multimedia/audio_process/doa/tests/test_manual_microphone_smoke.sh
