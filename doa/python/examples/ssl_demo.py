@@ -14,11 +14,14 @@ Examples::
     ssl_demo.py -c 3 -t -d 0.063 --sweep 0:330:30
     ssl_demo.py -c 3 -f 3ch.wav -d 0.063 -v
     ssl_demo.py -c 3 -t -d 0.063 --quality-threshold 0.5
+    ssl_demo.py -c 3 -l -d 0.063 -i $SPV_INPUT_DEVICE \\
+        --capture-channels 4 --pick 2,3,4
 """
 
 import argparse
 import math
 import sys
+import threading
 import time
 import wave
 from typing import List, Optional
@@ -655,61 +658,155 @@ def run_live_multi(args) -> int:
 
     cfg = make_multi_cfg(args, args.rate)
     n_ch = len(cfg.microphones)
+    try:
+        cap_ch, pick = resolve_live_channel_map(args, n_ch)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
     loc = MultiSoundLocator(cfg)
     if not loc.initialize():
         print("Initialize failed", file=sys.stderr)
         return 1
 
-    chunk_size = cfg.frame_size * n_ch * 2
-    spacemit_audio.init(sample_rate=args.rate, channels=n_ch,
+    chunk_size = cfg.frame_size * cap_ch * 2
+    spacemit_audio.init(sample_rate=args.rate, channels=cap_ch,
                         chunk_size=chunk_size,
                         capture_device=args.input_device, player_device=-1)
     capture = spacemit_audio.AudioCapture(args.input_device)
-    state = {"frames": 0, "valid": 0}
+    state = {"callbacks": 0, "frames": 0, "valid": 0, "latest": None}
+    state_lock = threading.Lock()
 
     def callback(data: bytes) -> None:
-        samples = np.frombuffer(data, dtype=np.int16).reshape(-1, n_ch)
-        if samples.shape[0] == 0:
+        latest = None
+        raw = np.frombuffer(data, dtype=np.int16)
+        frames = raw.size // cap_ch
+        if frames <= 0:
             return
+        raw = raw[:frames * cap_ch].reshape(-1, cap_ch)
+        samples = np.ascontiguousarray(raw[:, pick])
         if loc.process_int16(samples):
-            state["frames"] += 1
             r = loc.result
-            if r.valid:
-                state["valid"] += 1
-                print(
-                    f"\r[{state['frames']:04d}] az: {r.azimuth_deg:7.2f}° "
-                    f"| conf: {r.confidence:.3f} | qual: {r.quality:.3f} "
-                    f"| clos: {r.closure_residual_sec * 1e6:.2f} us    ",
-                    end="", flush=True,
-                )
-            elif args.verbose:
-                print(
-                    f"\r[{state['frames']:04d}] az: ------- | "
-                    f"conf: {r.confidence:.3f}    ",
-                    end="", flush=True,
-                )
+            latest = {
+                "valid": bool(r.valid),
+                "azimuth": float(r.azimuth_deg),
+                "confidence": float(r.confidence),
+                "quality": float(r.quality),
+                "closure_us": float(r.closure_residual_sec * 1e6),
+            }
+        with state_lock:
+            state["callbacks"] += 1
+            if latest is not None:
+                state["frames"] += 1
+                latest["frame"] = state["frames"]
+                state["latest"] = latest
+                if latest["valid"]:
+                    state["valid"] += 1
 
     capture.set_callback(callback)
-    if not capture.start(sample_rate=args.rate, channels=n_ch,
+    if not capture.start(sample_rate=args.rate, channels=cap_ch,
                          chunk_size=chunk_size):
         print("Failed to start capture", file=sys.stderr)
         capture.close()
         return 1
     print(
-        f"=== Live {n_ch}-ch Capture ===\n"
+        f"=== Live Capture ===\n"
+        f"capture: {cap_ch}ch | DOA mics: {n_ch} | "
         f"side: {args.mic_distance:.4f} m | rate: {args.rate} Hz | "
-        f"device: {args.input_device}\nPress Ctrl+C to stop.\n"
+        f"device: {args.input_device}\n"
+        f"channel map (1-based): "
+        f"{', '.join(f'ch{src + 1}->mic{dst}' for dst, src in enumerate(pick))}"
+        f"\nPress Ctrl+C to stop.\n"
     )
+    last_printed = 0
     try:
         while True:
             time.sleep(0.1)
+            with state_lock:
+                latest = state["latest"]
+                latest = dict(latest) if latest is not None else None
+            if latest is None or latest["frame"] == last_printed:
+                continue
+            last_printed = latest["frame"]
+            if latest["valid"]:
+                print(
+                    f"\r[{latest['frame']:04d}] "
+                    f"az: {latest['azimuth']:7.2f}° | "
+                    f"conf: {latest['confidence']:.3f} | "
+                    f"qual: {latest['quality']:.3f} | "
+                    f"clos: {latest['closure_us']:.2f} us    ",
+                    end="", flush=True,
+                )
+            elif args.verbose:
+                print(
+                    f"\r[{latest['frame']:04d}] az: ------- | "
+                    f"conf: {latest['confidence']:.3f}    ",
+                    end="", flush=True,
+                )
     except KeyboardInterrupt:
         pass
     finally:
         capture.stop()
         capture.close()
-    print(f"\nStopped. frames: {state['frames']}, valid: {state['valid']}")
+    print(
+        f"\nStopped. callbacks: {state['callbacks']}, "
+        f"frames: {state['frames']}, valid: {state['valid']}"
+    )
     return 0
+
+
+def parse_pick(spec: str) -> List[int]:
+    values = []
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            values.append(int(item))
+        except ValueError as exc:
+            raise ValueError(
+                f"--pick expects comma-separated integer channels (got '{spec}')"
+            ) from exc
+    return values
+
+
+def resolve_live_channel_map(args, n_ch: int):
+    cap_ch = n_ch if args.capture_channels is None else args.capture_channels
+    if cap_ch <= 0:
+        raise ValueError(
+            f"--capture-channels must be positive (got {cap_ch})"
+        )
+    if cap_ch < n_ch:
+        raise ValueError(
+            f"--capture-channels must be >= DOA mic count {n_ch} "
+            f"(got {cap_ch})"
+        )
+
+    if args.pick:
+        pick_1based = parse_pick(args.pick)
+        if len(pick_1based) != n_ch:
+            raise ValueError(
+                f"--pick must provide exactly {n_ch} channels "
+                f"(got {len(pick_1based)})"
+            )
+        if len(set(pick_1based)) != len(pick_1based):
+            raise ValueError("--pick channels must be unique")
+        bad = [value for value in pick_1based
+               if value < 1 or value > cap_ch]
+        if bad:
+            raise ValueError(
+                f"--pick channels must be in [1, {cap_ch}] "
+                f"(bad: {bad})"
+            )
+    else:
+        if cap_ch != n_ch:
+            raise ValueError(
+                "--pick is required when --capture-channels differs from "
+                "the DOA mic count"
+            )
+        pick_1based = list(range(1, n_ch + 1))
+
+    return cap_ch, [value - 1 for value in pick_1based]
 
 
 # ---------------------------------------------------------------------------
@@ -780,6 +877,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-frequency-hz", type=float, default=None,
                    help=("Override config.max_frequency_hz (default 0 "
                          "= auto alias-safe c / 2·d_max)"))
+    p.add_argument("--capture-channels", type=int, default=None,
+                   help=("Live capture device channel count. Use when the "
+                         "device exposes extra channels such as AEC reference "
+                         "or loopback."))
+    p.add_argument("--pick", default=None,
+                   help=("1-based live capture channels feeding DOA mics, "
+                         "one per mic. Example for SPV 4ch: --capture-channels "
+                         "4 --pick 2,3,4."))
     return p
 
 
@@ -810,6 +915,17 @@ def main() -> None:
             "Error: --flip is 2-ch only. For 3+ ch use --azimuth-offset 180.",
             file=sys.stderr,
         )
+        sys.exit(1)
+    live_channel_args = (
+        args.capture_channels is not None or args.pick is not None
+    )
+    if live_channel_args and not args.live:
+        print("Error: --capture-channels/--pick are live-capture options",
+              file=sys.stderr)
+        sys.exit(1)
+    if live_channel_args and args.channels < 3:
+        print("Error: --capture-channels/--pick are only supported for -c 3+",
+              file=sys.stderr)
         sys.exit(1)
 
     # Resolve mic_distance with per-mode default + warning.

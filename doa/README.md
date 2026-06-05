@@ -146,8 +146,14 @@ python python/examples/ssl_demo.py -c 3 -f 3ch.wav -d 0.063 -v
 # 实时麦克风（需先安装 spacemit-audio）
 # python -m pip install spacemit-audio \
 #     --index-url https://git.spacemit.com/api/v4/projects/33/packages/pypi/simple
+# 运行前先用 audio_demo list 或 spacemit_audio.AudioCapture.list_devices()
+# 查询 SPV 的 PortAudio 输入设备索引，并把下面的 1 替换为实际查询结果。
+# 变量赋值和 python 命令需在同一个 shell session 内执行。
+SPV_INPUT_DEVICE=1
 python python/examples/ssl_demo.py -c 2 -l -d 0.058
 python python/examples/ssl_demo.py -c 3 -l -d 0.063
+python python/examples/ssl_demo.py -c 3 -l -d 0.063 -r 16000 -i "$SPV_INPUT_DEVICE" \
+    --capture-channels 4 --pick 2,3,4 --avg-seconds 3 -v
 ```
 
 ## 3. 应用开发
