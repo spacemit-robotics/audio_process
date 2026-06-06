@@ -20,11 +20,19 @@ Examples::
 
 import argparse
 import math
+from pathlib import Path
 import sys
 import threading
 import time
 import wave
 from typing import List, Optional
+
+_THIS_FILE = Path(__file__).resolve()
+_PYTHON_ROOT = _THIS_FILE.parents[1]
+_REPO_ROOT = _PYTHON_ROOT.parent
+for _path in (str(_REPO_ROOT), str(_PYTHON_ROOT)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 try:
     import numpy as np
@@ -50,8 +58,10 @@ except ImportError as exc:
 
 DEFAULT_MIC_DISTANCE_2CH = 0.058
 DEFAULT_MIC_DISTANCE_3CH = 0.063
-LANCZOS_TAPS = 31
-LANCZOS_HALF = LANCZOS_TAPS // 2
+SYNTHETIC_SOURCE_SEED = 2
+SYNTHETIC_TONE_COUNT = 29
+SYNTHETIC_MIN_HZ = 300.0
+SYNTHETIC_MAX_HZ = 3800.0
 
 
 # ---------------------------------------------------------------------------
@@ -354,75 +364,40 @@ def run_live_2ch(mic_dist: float, sample_rate: int, device_index: int,
 # 3+ channel mode (MultiSoundLocator)
 # ---------------------------------------------------------------------------
 
-def is_pair_endfire(angle: float) -> bool:
-    return any(
-        circular_error(angle, c) <= 0.5
-        for c in (60.0, 120.0, 240.0, 300.0)
-    )
-
-
 def tolerance_for(angle: float, noise_enabled: bool) -> float:
-    return 5.0 if noise_enabled or is_pair_endfire(angle) else 2.0
+    return 5.0
 
 
-def sinc(x: float) -> float:
-    if abs(x) < 1e-6:
-        return 1.0
-    pix = math.pi * x
-    return math.sin(pix) / pix
-
-
-def lanczos_kernel(x: float) -> float:
-    a = float(LANCZOS_HALF)
-    if abs(x) >= a:
-        return 0.0
-    return sinc(x) * sinc(x / a)
-
-
-def make_chirp(n_samples: int, sample_rate: int) -> np.ndarray:
-    duration = n_samples / float(sample_rate)
-    f0 = 200.0
-    f1 = 4000.0
-    sweep = (f1 - f0) / duration
-    t = np.arange(n_samples, dtype=np.float32) / float(sample_rate)
-    phase = 2.0 * math.pi * (f0 * t + 0.5 * sweep * t * t)
-    return (0.7 * np.sin(phase)).astype(np.float32)
-
-
-def fractional_delay(base: np.ndarray, n_frames: int,
-                     delay_samples: float) -> np.ndarray:
-    out = np.zeros(n_frames, dtype=np.float32)
-    pad = (len(base) - n_frames) // 2
-    for n in range(n_frames):
-        src_pos = float(n + pad) - delay_samples
-        center = math.floor(src_pos)
-        value = 0.0
-        weight_sum = 0.0
-        for k in range(center - LANCZOS_HALF, center + LANCZOS_HALF + 1):
-            if 0 <= k < len(base):
-                x = src_pos - float(k)
-                w = lanczos_kernel(x)
-                value += float(base[k]) * w
-                weight_sum += w
-        if abs(weight_sum) > 1e-6:
-            value /= weight_sum
-        out[n] = value
-    return out
+def make_synthetic_phases() -> np.ndarray:
+    phases = np.empty(SYNTHETIC_TONE_COUNT, dtype=np.float64)
+    state = SYNTHETIC_SOURCE_SEED & 0xFFFFFFFF
+    for idx in range(SYNTHETIC_TONE_COUNT):
+        state = (1664525 * state + 1013904223) & 0xFFFFFFFF
+        u = state / 4294967296.0
+        phases[idx] = u * 2.0 * math.pi
+    return phases
 
 
 def generate_synthetic(cfg, angle_deg: float,
                        noise_snr_db: Optional[float]) -> np.ndarray:
     n_frames = cfg.frame_size * cfg.avg_frames
-    pad = 64
     angle_rad = math.radians(angle_deg)
     direction = (math.cos(angle_rad), math.sin(angle_rad))
-    base = make_chirp(n_frames + 2 * pad, cfg.sample_rate)
+    phases = make_synthetic_phases()
+    freqs = np.linspace(
+        SYNTHETIC_MIN_HZ, SYNTHETIC_MAX_HZ,
+        SYNTHETIC_TONE_COUNT, dtype=np.float64
+    )
+    t = np.arange(n_frames, dtype=np.float64) / float(cfg.sample_rate)
     channels = []
     for mic in cfg.microphones:
         advance = (mic.x * direction[0]
                    + mic.y * direction[1]) / cfg.sound_speed
-        delay = -advance * cfg.sample_rate
-        channels.append(fractional_delay(base, n_frames, delay))
+        signal = np.zeros(n_frames, dtype=np.float64)
+        for freq, phase in zip(freqs, phases):
+            signal += np.sin(2.0 * math.pi * freq * (t + advance) + phase)
+        signal *= 0.3 / float(SYNTHETIC_TONE_COUNT)
+        channels.append(signal.astype(np.float32))
     data = np.stack(channels, axis=1).astype(np.float32)
     if noise_snr_db is not None:
         rng = np.random.default_rng(42)
@@ -497,6 +472,8 @@ def make_multi_cfg(args, sample_rate: int) -> MultiSoundLocatorConfig:
         cfg.quality_threshold = args.quality_threshold
     if args.margin_threshold is not None:
         cfg.margin_threshold = args.margin_threshold
+    if args.min_signal_rms is not None:
+        cfg.min_signal_rms = args.min_signal_rms
     if args.closure_threshold_samples is not None:
         cfg.closure_threshold_samples = args.closure_threshold_samples
     if args.closure_threshold_fraction is not None:
@@ -532,17 +509,19 @@ def run_test_multi(args) -> int:
     noise_enabled = args.noise_snr is not None
 
     for angle in angles:
+        expected = normalize_angle(angle + args.azimuth_offset)
+        tol = tolerance_for(angle, noise_enabled)
         cfg = make_multi_cfg(args, args.rate)
         loc = MultiSoundLocator(cfg)
         if not loc.initialize():
             print("Initialize failed", file=sys.stderr)
             return 1
         data = generate_synthetic(cfg, angle, args.noise_snr)
-        ready = loc.process(data)
+        ready = loc.process_channels(
+            [data[:, ch].copy() for ch in range(data.shape[1])]
+        )
         r = loc.result
-        expected = normalize_angle(angle + args.azimuth_offset)
         err = circular_error(r.azimuth_deg, expected)
-        tol = tolerance_for(angle, noise_enabled)
         ok = bool(ready and r.valid and err <= tol)
         if ok:
             passed += 1
@@ -657,6 +636,8 @@ def run_live_multi(args) -> int:
         return 1
 
     cfg = make_multi_cfg(args, args.rate)
+    if args.min_signal_rms is None:
+        cfg.min_signal_rms = 0.003
     n_ch = len(cfg.microphones)
     try:
         cap_ch, pick = resolve_live_channel_map(args, n_ch)
@@ -866,6 +847,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Override config.quality_threshold (default 0.0)")
     p.add_argument("--margin-threshold", type=float, default=None,
                    help="Override config.margin_threshold (default 0.6)")
+    p.add_argument("--min-signal-rms", type=float, default=None,
+                   help=("Drop frames below this RMS before GCC-PHAT. "
+                         "Default 0 for test/file, 0.003 for live; pass 0 "
+                         "in live mode to disable."))
     p.add_argument("--closure-threshold-samples", type=float, default=None,
                    help=("Override config.closure_threshold_samples "
                          "(N=3 only; default 0.0; effective=max(samples, "

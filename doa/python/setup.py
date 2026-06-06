@@ -1,5 +1,21 @@
+import platform
+
 from setuptools import setup
 from pybind11.setup_helpers import Pybind11Extension, build_ext
+
+
+def riscv_compile_args():
+    machine = platform.machine().lower()
+    if "riscv" not in machine:
+        return []
+    return [
+        "-O2",
+        "-fno-strict-overflow",
+        "-mstrict-align",
+        "-fno-strict-aliasing",
+        "-fno-aggressive-loop-optimizations",
+    ]
+
 
 ext_modules = [
     Pybind11Extension(
@@ -12,6 +28,7 @@ ext_modules = [
         ],
         include_dirs=["../include"],
         libraries=["fftw3f", "m"],
+        extra_compile_args=riscv_compile_args(),
         cxx_std=17,
     ),
 ]

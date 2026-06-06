@@ -61,11 +61,14 @@
 
 namespace {
 
-constexpr int kLanczosTaps = 31;
-constexpr int kLanczosHalf = kLanczosTaps / 2;
 constexpr float kDefault2chMicDistance = 0.058f;
 constexpr float kDefault3chMicDistance = 0.063f;
 constexpr float kDefaultLiveAvgSeconds = 10.0f;
+constexpr float kDefaultLiveMinSignalRms = 0.003f;
+constexpr int kSyntheticSourceSeed = 2;
+constexpr int kSyntheticToneCount = 29;
+constexpr double kSyntheticMinHz = 300.0;
+constexpr double kSyntheticMaxHz = 3800.0;
 
 struct WavData {
     std::vector<int16_t> samples;
@@ -513,75 +516,59 @@ int RunLive_2ch(float mic_distance, int sample_rate, int device_index,
 // 3+ channel mode (MultiSoundLocator)
 // ===========================================================================
 
-bool IsPairEndfireAngle(float a) {
-    constexpr float kAngles[] = {60.0f, 120.0f, 240.0f, 300.0f};
-    for (float c : kAngles) if (CircularError(a, c) <= 0.5f) return true;
-    return false;
-}
-
 float ToleranceFor(float a, bool noise) {
-    return (noise || IsPairEndfireAngle(a)) ? 5.0f : 2.0f;
+    (void)a;
+    (void)noise;
+    return 5.0f;
 }
 
-float Sinc(float x) {
-    if (std::fabs(x) < 1e-6f) return 1.0f;
-    const float p = static_cast<float>(M_PI) * x;
-    return std::sin(p) / p;
-}
-
-float LanczosKernel(float x) {
-    constexpr float a = static_cast<float>(kLanczosHalf);
-    if (std::fabs(x) >= a) return 0.0f;
-    return Sinc(x) * Sinc(x / a);
-}
-
-std::vector<float> MakeChirp(int n, int sr) {
-    std::vector<float> s(n);
-    const float dur = static_cast<float>(n) / sr;
-    const float f0 = 200.0f, f1 = 4000.0f, sweep = (f1 - f0) / dur;
-    for (int i = 0; i < n; ++i) {
-        const float t = static_cast<float>(i) / sr;
-        const float phase = 2.0f * static_cast<float>(M_PI)
-            * (f0 * t + 0.5f * sweep * t * t);
-        s[i] = 0.7f * std::sin(phase);
+std::vector<double> MakeSyntheticPhases() {
+    std::vector<double> phases;
+    phases.reserve(kSyntheticToneCount);
+    uint32_t state = static_cast<uint32_t>(kSyntheticSourceSeed);
+    for (int i = 0; i < kSyntheticToneCount; ++i) {
+        state = state * 1664525u + 1013904223u;
+        const double u = static_cast<double>(state) / 4294967296.0;
+        phases.push_back(u * 2.0 * M_PI);
     }
-    return s;
-}
-
-std::vector<float> FractionalDelay(const std::vector<float>& base,
-    int n_frames, float delay_samples) {
-    std::vector<float> out(n_frames, 0.0f);
-    const int pad = (static_cast<int>(base.size()) - n_frames) / 2;
-    for (int n = 0; n < n_frames; ++n) {
-        const float src = static_cast<float>(n + pad) - delay_samples;
-        const int center = static_cast<int>(std::floor(src));
-        float val = 0.0f, wsum = 0.0f;
-        for (int k = center - kLanczosHalf; k <= center + kLanczosHalf; ++k) {
-            if (k < 0 || k >= static_cast<int>(base.size())) continue;
-            const float x = src - static_cast<float>(k);
-            const float w = LanczosKernel(x);
-            val += base[k] * w; wsum += w;
-        }
-        if (std::fabs(wsum) > 1e-6f) val /= wsum;
-        out[n] = val;
-    }
-    return out;
+    return phases;
 }
 
 std::vector<float> GenerateSyntheticInterleaved(
     const SpacemitAudio::MultiSoundLocatorConfig& cfg,
     float angle_deg, float noise_snr_db) {
     const int n_frames = cfg.frame_size * cfg.avg_frames;
-    const int pad = 64;
     const int sr = cfg.sample_rate;
-    const float a_rad = angle_deg * static_cast<float>(M_PI) / 180.0f;
-    const float dx = std::cos(a_rad), dy = std::sin(a_rad);
-    auto base = MakeChirp(n_frames + 2 * pad, sr);
+    const double a_rad =
+        static_cast<double>(angle_deg) * M_PI / 180.0;
+    const double dx = std::cos(a_rad);
+    const double dy = std::sin(a_rad);
+    const auto phases = MakeSyntheticPhases();
     std::vector<std::vector<float>> chs;
     chs.reserve(cfg.microphones.size());
     for (const auto& m : cfg.microphones) {
-        const float adv = (m.x * dx + m.y * dy) / cfg.sound_speed;
-        chs.push_back(FractionalDelay(base, n_frames, -adv * sr));
+        const double adv =
+            (static_cast<double>(m.x) * dx + static_cast<double>(m.y) * dy)
+            / static_cast<double>(cfg.sound_speed);
+        std::vector<float> channel(n_frames, 0.0f);
+        for (int frame = 0; frame < n_frames; ++frame) {
+            const double t = static_cast<double>(frame) / static_cast<double>(sr);
+            double sample = 0.0;
+            for (int tone = 0; tone < kSyntheticToneCount; ++tone) {
+                const double ratio = kSyntheticToneCount > 1
+                    ? static_cast<double>(tone)
+                        / static_cast<double>(kSyntheticToneCount - 1)
+                    : 0.0;
+                const double freq =
+                    kSyntheticMinHz + (kSyntheticMaxHz - kSyntheticMinHz) * ratio;
+                sample += std::sin(2.0 * M_PI * freq * (t + adv)
+                                    + phases[static_cast<size_t>(tone)]);
+            }
+            channel[static_cast<size_t>(frame)] =
+                static_cast<float>(0.3 * sample
+                    / static_cast<double>(kSyntheticToneCount));
+        }
+        chs.push_back(std::move(channel));
     }
     const bool noise = std::isfinite(noise_snr_db);
     if (noise) {
@@ -652,6 +639,7 @@ struct MultiOverrides {
     float closure_threshold_fraction = 0;
     bool have_quality = false;     float quality_threshold = 0;
     bool have_margin = false;      float margin_threshold = 0;
+    bool have_min_signal_rms = false; float min_signal_rms = 0;
     bool have_max_freq = false;    float max_frequency_hz = 0;
 };
 
@@ -676,6 +664,7 @@ SpacemitAudio::MultiSoundLocatorConfig MakeMultiConfig(
     }
     if (ov.have_quality)  cfg.quality_threshold = ov.quality_threshold;
     if (ov.have_margin)   cfg.margin_threshold = ov.margin_threshold;
+    if (ov.have_min_signal_rms) cfg.min_signal_rms = ov.min_signal_rms;
     if (ov.have_max_freq) cfg.max_frequency_hz = ov.max_frequency_hz;
     return cfg;
 }
@@ -694,6 +683,18 @@ int RunTest_3ch(float mic_distance, int sample_rate,
 
     int pass = 0, fail = 0;
     const bool noise = std::isfinite(noise_snr_db);
+
+    if (angles.size() > 1) {
+        auto warm_cfg = MakeMultiConfig(mic_distance, sample_rate, az_offset,
+            max_avg_seconds, positions_override, ov);
+        SpacemitAudio::MultiSoundLocator warm_loc(warm_cfg);
+        if (warm_loc.Initialize()) {
+            const auto warm = GenerateSyntheticInterleaved(
+                warm_cfg, angles.front(), noise_snr_db);
+            const int warm_ch = static_cast<int>(warm_cfg.microphones.size());
+            warm_loc.Process(warm.data(), warm.size() / warm_ch, warm_ch);
+        }
+    }
 
     for (float angle : angles) {
         const float expected = NormalizeAngle360(angle + az_offset);
@@ -809,6 +810,9 @@ int RunLive_3ch(float mic_distance, int sample_rate, int device_index,
                 int capture_channels, const std::vector<int>& pick) {
     auto cfg = MakeMultiConfig(mic_distance, sample_rate, az_offset,
         max_avg_seconds, positions_override, ov);
+    if (!ov.have_min_signal_rms) {
+        cfg.min_signal_rms = kDefaultLiveMinSignalRms;
+    }
     const int n_ch = static_cast<int>(cfg.microphones.size());
     if (capture_channels < 0) {
         std::fprintf(stderr,
@@ -957,6 +961,7 @@ int RunLive_3ch(float mic_distance, int sample_rate, int device_index,
     g_stop_requested = 0;
     std::signal(SIGINT, HandleSignal);
     std::signal(SIGTERM, HandleSignal);
+    int printed_rdy = 0;
     while (!g_stop_requested) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         if (callback_failed.load(std::memory_order_relaxed)) {
@@ -978,6 +983,8 @@ int RunLive_3ch(float mic_distance, int sample_rate, int device_index,
             ok = have_r;
         }
         if (!ok) continue;
+        if (idx == printed_rdy) continue;
+        printed_rdy = idx;
         if (r.valid) {
             std::printf("\r[%04d] az: %7.2f° | conf: %.3f | qual: %.3f | clos: %.2f us    ",
                         idx, r.azimuth_deg, r.confidence, r.quality,
@@ -1012,13 +1019,15 @@ void PrintUsage(const char* prog) {
     std::printf("                   [--azimuth-offset DEG] [--positions SPEC]\n");
     std::printf("                   [--avg-seconds S] [--quality-threshold F]\n");
     std::printf("                   [--margin-threshold F] [--closure-threshold-samples F]\n");
-    std::printf("                   [--closure-threshold-fraction F] [--max-frequency-hz F]\n");
+    std::printf("                   [--closure-threshold-fraction F] [--min-signal-rms F]\n");
+    std::printf("                   [--max-frequency-hz F]\n");
     std::printf("  %s -c 3 -f Nch.wav [-d M] [-v] [--positions SPEC]\n", prog);
     std::printf("                   [--azimuth-offset DEG] [--avg-seconds S]\n");
 #ifdef HAS_SPACEMIT_AUDIO
     std::printf("  %s -c 3 -l [-d M] [-r RATE] [-i DEV] [-v]\n", prog);
     std::printf("                   [--positions SPEC] [--azimuth-offset DEG]\n");
-    std::printf("                   [--avg-seconds S] [--capture-channels N] [--pick i,j,k]\n");
+    std::printf("                   [--avg-seconds S] [--min-signal-rms F]\n");
+    std::printf("                   [--capture-channels N] [--pick i,j,k]\n");
 #endif
     std::printf("\n");
     std::printf("  %s -h | --help\n\n", prog);
@@ -1051,6 +1060,10 @@ void PrintUsage(const char* prog) {
     std::printf("                              history since Reset.\n");
     std::printf("  --quality-threshold F      Override config.quality_threshold (default 0.0)\n");
     std::printf("  --margin-threshold F       Override config.margin_threshold (default 0.6)\n");
+    std::printf("  --min-signal-rms F         Drop frames below this RMS before GCC-PHAT.\n");
+    std::printf("                              Default: 0 for test/file, %.3f for live.\n",
+                kDefaultLiveMinSignalRms);
+    std::printf("                              Pass 0 in live mode to disable this activity gate.\n");
     std::printf("  --closure-threshold-samples F\n");
     std::printf("                              Explicit closure cap in samples (N=3 only;\n");
     std::printf("                              default 0.0; effective=max(samples,\n");
@@ -1145,6 +1158,9 @@ bool ParseArgs(int argc, char* argv[], Args& a) {
         } else if (std::strcmp(s, "--margin-threshold") == 0 && i + 1 < argc) {
             a.multi_overrides.have_margin = true;
             a.multi_overrides.margin_threshold = static_cast<float>(std::atof(argv[++i]));
+        } else if (std::strcmp(s, "--min-signal-rms") == 0 && i + 1 < argc) {
+            a.multi_overrides.have_min_signal_rms = true;
+            a.multi_overrides.min_signal_rms = static_cast<float>(std::atof(argv[++i]));
         } else if (std::strcmp(s, "--closure-threshold-samples") == 0 && i + 1 < argc) {
             a.multi_overrides.have_closure = true;
             a.multi_overrides.closure_threshold_samples =
