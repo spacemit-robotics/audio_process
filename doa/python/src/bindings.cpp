@@ -381,6 +381,8 @@ PYBIND11_MODULE(_spacemit_audio_process, m) {
             &MultiSoundLocatorConfig::search_step_deg)
         .def_readwrite("margin_threshold",
             &MultiSoundLocatorConfig::margin_threshold)
+        .def_readwrite("min_signal_rms",
+            &MultiSoundLocatorConfig::min_signal_rms)
         .def_readwrite("max_avg_seconds",
             &MultiSoundLocatorConfig::max_avg_seconds)
         // [A5] quality threshold (default 0.0 = disabled; v1 backward-compat)

@@ -257,6 +257,12 @@ struct MultiSoundLocatorConfig {
     /// Silence / multi-source frames typically have margin < 0.5.
     float margin_threshold = 0.6f;
 
+    /// Minimum per-frame RMS before GCC-PHAT processing. 0 disables this gate.
+    /// This is an activity gate, not a DOA confidence gate: GCC-PHAT
+    /// normalizes spectra, so very quiet noise can otherwise produce a stable
+    /// looking correlation peak and a misleading azimuth.
+    float min_signal_rms = 0.0f;
+
     /// [A5] Minimum `quality` (clamped 1 - |1 - ||n_hat|||) for valid result.
     /// 0 disables this gate; 0.5 is the AI-variant default if you opt in.
     float quality_threshold = 0.0f;
@@ -338,6 +344,7 @@ struct MultiSoundLocatorResult {
 
     /// `confidence >= confidence_threshold` AND
     /// `score_margin >= margin_threshold` AND
+    /// frame RMS >= `min_signal_rms` AND
     /// `quality >= quality_threshold` AND
     /// (N != 3 OR `closure_samples <= closure_threshold_samples`).
     bool valid = false;

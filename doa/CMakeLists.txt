@@ -15,6 +15,23 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+set(AUDIO_PROCESS_RISCV_CXX_FLAGS)
+set(AUDIO_PROCESS_RISCV_PYTHON_CXX_FLAGS)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv|RISCV")
+    list(APPEND AUDIO_PROCESS_RISCV_CXX_FLAGS
+        -mstrict-align
+        -fno-strict-aliasing
+        -fno-aggressive-loop-optimizations
+    )
+    list(APPEND AUDIO_PROCESS_RISCV_PYTHON_CXX_FLAGS
+        -O2
+        -fno-strict-overflow
+        ${AUDIO_PROCESS_RISCV_CXX_FLAGS}
+    )
+    message(STATUS "[audio_process] RISC-V conservative C++ flags: ${AUDIO_PROCESS_RISCV_CXX_FLAGS}")
+    message(STATUS "[audio_process] RISC-V Python extension flags: ${AUDIO_PROCESS_RISCV_PYTHON_CXX_FLAGS}")
+endif()
+
 # -------------------------------------------------------
 # Options
 # -------------------------------------------------------
@@ -76,6 +93,9 @@ target_link_libraries(sound_locator
     PUBLIC Threads::Threads
     PRIVATE ${FFTW3F_LIBRARIES} m
 )
+if(AUDIO_PROCESS_RISCV_CXX_FLAGS)
+    target_compile_options(sound_locator PRIVATE ${AUDIO_PROCESS_RISCV_CXX_FLAGS})
+endif()
 target_include_directories(sound_locator PRIVATE ${FFTW3F_INCLUDE_DIRS})
 if(FFTW3F_LIBRARY_DIRS)
     target_link_directories(sound_locator PRIVATE ${FFTW3F_LIBRARY_DIRS})
@@ -177,11 +197,23 @@ if(AUDIO_PROCESS_BUILD_PYTHON)
         endif()
 
         if(pybind11_FOUND)
-            pybind11_add_module(_spacemit_audio_process
+            pybind11_add_module(_spacemit_audio_process NO_EXTRAS
                 ${CMAKE_CURRENT_SOURCE_DIR}/python/src/bindings.cpp
+                ${SOUND_LOCATOR_SOURCES}
             )
 
-            target_link_libraries(_spacemit_audio_process PRIVATE sound_locator)
+            # Keep the CMake-built extension aligned with setup.py/wheel builds.
+            target_link_libraries(_spacemit_audio_process PRIVATE Threads::Threads ${FFTW3F_LIBRARIES} m)
+            target_include_directories(_spacemit_audio_process PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/include
+                ${FFTW3F_INCLUDE_DIRS}
+            )
+            if(FFTW3F_LIBRARY_DIRS)
+                target_link_directories(_spacemit_audio_process PRIVATE ${FFTW3F_LIBRARY_DIRS})
+            endif()
+            if(AUDIO_PROCESS_RISCV_PYTHON_CXX_FLAGS)
+                target_compile_options(_spacemit_audio_process PRIVATE ${AUDIO_PROCESS_RISCV_PYTHON_CXX_FLAGS})
+            endif()
 
             set(PYTHON_BINDINGS_ENABLED ON)
             message(STATUS "[audio_process] Python bindings enabled (${Python3_EXECUTABLE})")

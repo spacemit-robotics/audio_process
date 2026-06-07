@@ -29,6 +29,7 @@
 #include <cmath>  // NOLINT(build/include_order)
 #include <cstring>  // NOLINT(build/include_order)
 #include <deque>  // NOLINT(build/include_order)
+#include <limits>  // NOLINT(build/include_order)
 #include <stdexcept>  // NOLINT(build/include_order)
 #include <string>  // NOLINT(build/include_order)
 #include <utility>  // NOLINT(build/include_order)
@@ -71,6 +72,12 @@ struct MultiSoundLocator::Impl {
         float row_x = 0.0f;  // p_j.x - p_i.x, matching GCC sign t_i - t_j
         float row_y = 0.0f;  // p_j.y - p_i.y
         float distance_m = 0.0f;
+    };
+
+    struct PairPeakCandidate {
+        float tdoa_seconds = 0.0f;
+        float delay_samples = 0.0f;
+        float peak_value = 0.0f;
     };
 
     MultiSoundLocatorConfig config;
@@ -134,6 +141,17 @@ struct MultiSoundLocator::Impl {
     bool ProcessPlanar(const float* const* channel_ptrs, size_t n_frames);
     bool ProcessChunk(const float* const* channel_ptrs, size_t chunk);
     bool SolveReadyPairs();
+    std::vector<PairPeakCandidate> CollectPairPeakCandidates(
+        size_t pair_idx, const internal::GccPhatPairResult& primary_result) const;
+    bool SelectThreeChannelPeaks(
+        const std::vector<internal::GccPhatPairResult>& pair_results,
+        std::vector<PairPeakCandidate>* selected_peaks) const;
+    bool SamplePairGccValue(
+        size_t pair_idx, const internal::GccPhatPairResult& pair_result,
+        float delay_samples, float* value) const;
+    bool SelectSrpPhatPeaks(
+        const std::vector<internal::GccPhatPairResult>& pair_results,
+        std::vector<PairPeakCandidate>* selected_peaks) const;
     int FindPairIndex(int i, int j) const;
 };
 
@@ -285,6 +303,30 @@ bool MultiSoundLocator::Impl::ProcessChunk(
     const size_t copy_len = std::min(
         chunk, static_cast<size_t>(config.frame_size));
 
+    if (config.min_signal_rms > 0.0f) {
+        double energy = 0.0;
+        size_t sample_count = 0;
+        for (int ch = 0; ch < n_channels; ++ch) {
+            for (size_t i = 0; i < copy_len; ++i) {
+                const double sample = static_cast<double>(channel_ptrs[ch][i]);
+                energy += sample * sample;
+            }
+            sample_count += copy_len;
+        }
+        const float rms = sample_count > 0
+            ? static_cast<float>(std::sqrt(energy / sample_count)) : 0.0f;
+        if (rms < config.min_signal_rms) {
+            for (auto& pair : gcc_pairs) {
+                pair.Reset();
+            }
+            std::fill(latest_tdoa.begin(), latest_tdoa.end(), 0.0f);
+            std::fill(latest_pair_confidences.begin(),
+                latest_pair_confidences.end(), 0.0f);
+            result = MultiSoundLocatorResult{};
+            return false;
+        }
+    }
+
     for (int ch = 0; ch < n_channels; ++ch) {
         std::memset(fft_in[ch], 0, padded_size * sizeof(float));
         for (size_t i = 0; i < copy_len; ++i) {
@@ -310,25 +352,396 @@ bool MultiSoundLocator::Impl::ProcessChunk(
     return SolveReadyPairs();
 }
 
+std::vector<MultiSoundLocator::Impl::PairPeakCandidate>
+MultiSoundLocator::Impl::CollectPairPeakCandidates(
+    size_t pair_idx, const internal::GccPhatPairResult& primary_result) const {
+    std::vector<PairPeakCandidate> candidates;
+    if (!primary_result.ready) {
+        return candidates;
+    }
+
+    auto add_candidate = [&candidates](const PairPeakCandidate& candidate) {
+        if (!std::isfinite(candidate.tdoa_seconds)
+            || !std::isfinite(candidate.delay_samples)
+            || !std::isfinite(candidate.peak_value)
+            || candidate.peak_value <= 0.0f) {
+            return;
+        }
+
+        constexpr float kDuplicateDelaySamples = 0.20f;
+        for (auto& existing : candidates) {
+            if (std::fabs(existing.delay_samples - candidate.delay_samples)
+                <= kDuplicateDelaySamples) {
+                if (candidate.peak_value > existing.peak_value) {
+                    existing = candidate;
+                }
+                return;
+            }
+        }
+        candidates.push_back(candidate);
+    };
+
+    add_candidate(PairPeakCandidate{
+        primary_result.tdoa_seconds,
+        primary_result.delay_samples,
+        primary_result.peak_value});
+
+    if (pair_idx >= gcc_pairs.size() || !primary_result.gcc
+        || primary_result.gcc_size <= 0 || upsample_factor <= 0
+        || config.sample_rate <= 0 || padded_size <= 0) {
+        return candidates;
+    }
+
+    const auto& gcc_pair = gcc_pairs[pair_idx];
+    const float* gcc = primary_result.gcc;
+    const int M = primary_result.gcc_size;
+    const int md_up = std::min(
+        gcc_pair.GetMaxDelaySamples() * upsample_factor, M / 2);
+    if (md_up < 0) {
+        return candidates;
+    }
+
+    const int active_bins = gcc_pair.GetBandLimitBinMax() + 1;
+    const float ideal_peak =
+        (2.0f * static_cast<float>(active_bins) - 1.0f)
+        / static_cast<float>(padded_size);
+
+    auto make_candidate = [&](int idx) {
+        const int left_idx = (idx - 1 + M) % M;
+        const int right_idx = (idx + 1) % M;
+        const float y_l = gcc[left_idx];
+        const float y_c = gcc[idx];
+        const float y_r = gcc[right_idx];
+        float delta = 0.0f;
+        const float denom = y_l - 2.0f * y_c + y_r;
+        if (std::fabs(denom) > kEpsilon) {
+            delta = 0.5f * (y_l - y_r) / denom;
+            delta = std::clamp(delta, -0.5f, 0.5f);
+        }
+
+        float up_delay = 0.0f;
+        if (idx <= M / 2) {
+            up_delay = static_cast<float>(idx) + delta;
+        } else {
+            up_delay = static_cast<float>(idx) - static_cast<float>(M) + delta;
+        }
+
+        PairPeakCandidate candidate;
+        candidate.delay_samples =
+            up_delay / static_cast<float>(upsample_factor);
+        candidate.tdoa_seconds =
+            candidate.delay_samples / static_cast<float>(config.sample_rate);
+        candidate.peak_value = (ideal_peak > kEpsilon)
+            ? (y_c / ideal_peak)
+            : y_c;
+        add_candidate(candidate);
+    };
+
+    auto is_local_max = [&](int idx) {
+        const int left_idx = (idx - 1 + M) % M;
+        const int right_idx = (idx + 1) % M;
+        return gcc[idx] >= gcc[left_idx] && gcc[idx] >= gcc[right_idx];
+    };
+
+    for (int idx = 0; idx <= md_up && idx < M; ++idx) {
+        if (is_local_max(idx)) {
+            make_candidate(idx);
+        }
+    }
+    for (int idx = M - md_up; idx < M; ++idx) {
+        if (idx >= 0 && is_local_max(idx)) {
+            make_candidate(idx);
+        }
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+        [](const PairPeakCandidate& a, const PairPeakCandidate& b) {
+            return a.peak_value > b.peak_value;
+        });
+    constexpr size_t kMaxCandidatesPerPair = 6;
+    if (candidates.size() > kMaxCandidatesPerPair) {
+        candidates.resize(kMaxCandidatesPerPair);
+    }
+    return candidates;
+}
+
+bool MultiSoundLocator::Impl::SelectThreeChannelPeaks(
+    const std::vector<internal::GccPhatPairResult>& pair_results,
+    std::vector<PairPeakCandidate>* selected_peaks) const {
+    if (!selected_peaks || n_channels != 3 || pairs.size() != 3
+        || pair_results.size() != 3) {
+        return false;
+    }
+
+    std::vector<PairPeakCandidate> candidates[3];
+    for (size_t pair_idx = 0; pair_idx < 3; ++pair_idx) {
+        candidates[pair_idx] =
+            CollectPairPeakCandidates(pair_idx, pair_results[pair_idx]);
+        if (candidates[pair_idx].empty()) {
+            return false;
+        }
+    }
+
+    const float closure_limit =
+        effective_closure_samples > 0.0f
+            ? effective_closure_samples
+            : std::numeric_limits<float>::infinity();
+
+    struct CombinationScore {
+        bool found = false;
+        bool closure_ok = false;
+        double score = -std::numeric_limits<double>::infinity();
+        float closure_samples = std::numeric_limits<float>::infinity();
+        float norm_error = std::numeric_limits<float>::infinity();
+        PairPeakCandidate peaks[3];
+    };
+
+    CombinationScore best;
+
+    auto consider = [&](const PairPeakCandidate& p0,
+                        const PairPeakCandidate& p1,
+                        const PairPeakCandidate& p2) {
+        const PairPeakCandidate peaks[3] = {p0, p1, p2};
+        float rhs_x = 0.0f;
+        float rhs_y = 0.0f;
+        double log_peak_sum = 0.0;
+        for (size_t pair_idx = 0; pair_idx < 3; ++pair_idx) {
+            const float distance_delta =
+                config.sound_speed * peaks[pair_idx].tdoa_seconds;
+            rhs_x += pairs[pair_idx].row_x * distance_delta;
+            rhs_y += pairs[pair_idx].row_y * distance_delta;
+            log_peak_sum += std::log(
+                std::max(static_cast<double>(peaks[pair_idx].peak_value),
+                        1e-12));
+        }
+
+        float wave_x = 0.0f;
+        float wave_y = 0.0f;
+        if (!SolveNormal(rhs_x, rhs_y, wave_x, wave_y)) {
+            return;
+        }
+
+        const float norm = std::sqrt(wave_x * wave_x + wave_y * wave_y);
+        float quality = 1.0f - std::fabs(1.0f - norm);
+        if (quality < 0.0f) quality = 0.0f;
+        if (quality > 1.0f) quality = 1.0f;
+
+        const float closure_sec =
+            p0.tdoa_seconds + p2.tdoa_seconds - p1.tdoa_seconds;
+        const float closure_samples =
+            std::fabs(closure_sec) * static_cast<float>(config.sample_rate);
+        const bool closure_ok = closure_samples <= closure_limit;
+        const float closure_norm = std::isfinite(closure_limit)
+            ? closure_samples / std::max(closure_limit, kEpsilon)
+            : closure_samples;
+        const double score =
+            (log_peak_sum / 3.0)
+            + std::log(std::max(static_cast<double>(quality), 1e-12))
+            - 2.0 * static_cast<double>(closure_norm);
+        const float norm_error = std::fabs(1.0f - norm);
+
+        const bool better =
+            !best.found
+            || (closure_ok && !best.closure_ok)
+            || (closure_ok == best.closure_ok
+                && (score > best.score + 1e-9
+                    || (std::fabs(score - best.score) <= 1e-9
+                        && (closure_samples < best.closure_samples
+                            || (std::fabs(closure_samples
+                                    - best.closure_samples) <= 1e-6f
+                                && norm_error < best.norm_error)))));
+        if (better) {
+            best.found = true;
+            best.closure_ok = closure_ok;
+            best.score = score;
+            best.closure_samples = closure_samples;
+            best.norm_error = norm_error;
+            best.peaks[0] = p0;
+            best.peaks[1] = p1;
+            best.peaks[2] = p2;
+        }
+    };
+
+    for (const auto& p0 : candidates[0]) {
+        for (const auto& p1 : candidates[1]) {
+            for (const auto& p2 : candidates[2]) {
+                consider(p0, p1, p2);
+            }
+        }
+    }
+
+    if (!best.found) {
+        return false;
+    }
+
+    for (size_t pair_idx = 0; pair_idx < 3; ++pair_idx) {
+        (*selected_peaks)[pair_idx] = best.peaks[pair_idx];
+    }
+    return true;
+}
+
+bool MultiSoundLocator::Impl::SamplePairGccValue(
+    size_t pair_idx, const internal::GccPhatPairResult& pair_result,
+    float delay_samples, float* value) const {
+    if (!value || pair_idx >= gcc_pairs.size() || !pair_result.gcc
+        || pair_result.gcc_size <= 1 || upsample_factor <= 0
+        || padded_size <= 0) {
+        return false;
+    }
+
+    const auto& gcc_pair = gcc_pairs[pair_idx];
+    const float max_delay =
+        static_cast<float>(gcc_pair.GetMaxDelaySamples()) + 1e-3f;
+    if (std::fabs(delay_samples) > max_delay) {
+        return false;
+    }
+
+    const int M = pair_result.gcc_size;
+    float up_delay = delay_samples * static_cast<float>(upsample_factor);
+    float wrapped = up_delay;
+    if (wrapped < 0.0f) {
+        wrapped += static_cast<float>(M);
+    }
+    if (wrapped < 0.0f || wrapped >= static_cast<float>(M)) {
+        wrapped = std::fmod(wrapped, static_cast<float>(M));
+        if (wrapped < 0.0f) {
+            wrapped += static_cast<float>(M);
+        }
+    }
+
+    const int idx0 = static_cast<int>(std::floor(wrapped));
+    const int idx1 = (idx0 + 1) % M;
+    const float frac = wrapped - static_cast<float>(idx0);
+    const float raw =
+        pair_result.gcc[idx0] * (1.0f - frac) + pair_result.gcc[idx1] * frac;
+
+    const int active_bins = gcc_pair.GetBandLimitBinMax() + 1;
+    const float ideal_peak =
+        (2.0f * static_cast<float>(active_bins) - 1.0f)
+        / static_cast<float>(padded_size);
+    *value = (ideal_peak > kEpsilon) ? (raw / ideal_peak) : raw;
+    return std::isfinite(*value);
+}
+
+bool MultiSoundLocator::Impl::SelectSrpPhatPeaks(
+    const std::vector<internal::GccPhatPairResult>& pair_results,
+    std::vector<PairPeakCandidate>* selected_peaks) const {
+    if (!selected_peaks || selected_peaks->size() != pairs.size()
+        || pair_results.size() != pairs.size() || pairs.empty()
+        || config.sample_rate <= 0 || config.sound_speed <= 0.0f) {
+        return false;
+    }
+
+    for (const auto& pair_result : pair_results) {
+        if (!pair_result.ready || !pair_result.gcc || pair_result.gcc_size <= 0) {
+            return false;
+        }
+    }
+
+    float step_deg = config.search_step_deg;
+    if (!std::isfinite(step_deg) || step_deg <= 0.0f) {
+        step_deg = 1.0f;
+    }
+    step_deg = std::clamp(step_deg, 0.25f, 15.0f);
+
+    struct SrpScore {
+        bool found = false;
+        float angle_deg = 0.0f;
+        double score = -std::numeric_limits<double>::infinity();
+        std::vector<PairPeakCandidate> peaks;
+    };
+
+    SrpScore best;
+    const int steps = std::max(1,
+        static_cast<int>(std::ceil(360.0f / step_deg)));
+
+    for (int step = 0; step < steps; ++step) {
+        const float angle_deg = std::min(
+            static_cast<float>(step) * step_deg, 360.0f - step_deg);
+        const float angle_rad =
+            angle_deg * static_cast<float>(M_PI) / 180.0f;
+        const float dir_x = std::cos(angle_rad);
+        const float dir_y = std::sin(angle_rad);
+
+        std::vector<PairPeakCandidate> peaks(pairs.size());
+        double score = 0.0;
+        bool ok = true;
+        for (size_t pair_idx = 0; pair_idx < pairs.size(); ++pair_idx) {
+            const auto& pair = pairs[pair_idx];
+            const float distance_delta =
+                pair.row_x * dir_x + pair.row_y * dir_y;
+            const float delay_samples =
+                distance_delta / config.sound_speed
+                * static_cast<float>(config.sample_rate);
+            float value = 0.0f;
+            if (!SamplePairGccValue(pair_idx, pair_results[pair_idx],
+                    delay_samples, &value)) {
+                ok = false;
+                break;
+            }
+            peaks[pair_idx] = PairPeakCandidate{
+                delay_samples / static_cast<float>(config.sample_rate),
+                delay_samples,
+                std::max(value, 0.0f)};
+            score += static_cast<double>(value);
+        }
+
+        if (!ok) {
+            continue;
+        }
+
+        if (!best.found || score > best.score) {
+            best.found = true;
+            best.angle_deg = angle_deg;
+            best.score = score;
+            best.peaks = std::move(peaks);
+        }
+    }
+
+    if (!best.found || best.score <= 0.0) {
+        return false;
+    }
+
+    *selected_peaks = std::move(best.peaks);
+    return true;
+}
+
 bool MultiSoundLocator::Impl::SolveReadyPairs() {
     float rhs_x = 0.0f;
     float rhs_y = 0.0f;
     float confidence_sum = 0.0f;  // [A4] arithmetic mean → kept as peak_score
     int valid_pairs_count = 0;
 
+    std::vector<internal::GccPhatPairResult> pair_results(pairs.size());
+    std::vector<PairPeakCandidate> selected_peaks(pairs.size());
     for (size_t pair_idx = 0; pair_idx < pairs.size(); ++pair_idx) {
         const auto pair_result = gcc_pairs[pair_idx].IfftAndPeak();
         if (!pair_result.ready) {
             return false;
         }
+        pair_results[pair_idx] = pair_result;
+        selected_peaks[pair_idx] = PairPeakCandidate{
+            pair_result.tdoa_seconds,
+            pair_result.delay_samples,
+            pair_result.peak_value};
+    }
 
-        latest_tdoa[pair_idx] = pair_result.tdoa_seconds;
-        latest_pair_confidences[pair_idx] = pair_result.peak_value;  // [A3]
-        const float distance_delta = config.sound_speed * pair_result.tdoa_seconds;
+    if (!SelectSrpPhatPeaks(pair_results, &selected_peaks)
+        && n_channels == 3 && pairs.size() == 3) {
+        SelectThreeChannelPeaks(pair_results, &selected_peaks);
+    }
+
+    for (size_t pair_idx = 0; pair_idx < pairs.size(); ++pair_idx) {
+        latest_tdoa[pair_idx] = selected_peaks[pair_idx].tdoa_seconds;
+        latest_pair_confidences[pair_idx] =
+            selected_peaks[pair_idx].peak_value;  // [A3]
+        const float distance_delta =
+            config.sound_speed * selected_peaks[pair_idx].tdoa_seconds;
         rhs_x += pairs[pair_idx].row_x * distance_delta;
         rhs_y += pairs[pair_idx].row_y * distance_delta;
-        confidence_sum += pair_result.peak_value;
-        if (pair_result.peak_value >= config.confidence_threshold) {
+        confidence_sum += selected_peaks[pair_idx].peak_value;
+        if (selected_peaks[pair_idx].peak_value
+            >= config.confidence_threshold) {
             ++valid_pairs_count;
         }
     }
